@@ -1,0 +1,12 @@
+[package]
+name = "damascus-chain"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+damascus-conv = { path = "../damascus-conv" }
+damascus-types = { path = "../damascus-types" }
+

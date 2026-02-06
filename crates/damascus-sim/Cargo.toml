@@ -1,0 +1,17 @@
+[package]
+name = "damascus-sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+damascus-conv = { path = "../damascus-conv" }
+damascus-ring = { path = "../damascus-ring" }
+damascus-types = { path = "../damascus-types" }
+

@@ -1,0 +1,11 @@
+[package]
+name = "damascus-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bincode.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+

@@ -1,0 +1,11 @@
+[package]
+name = "damascus-twist"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+damascus-types = { path = "../damascus-types" }
+
