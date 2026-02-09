@@ -33,6 +33,10 @@ impl SystemParams {
             self.poly_len.is_power_of_two(),
             "poly_len must be power of two"
         );
+        ensure!(
+            self.vector_len == self.poly_len,
+            "vector_len and poly_len must be equal (square tensor)"
+        );
         Ok(())
     }
 }
@@ -41,6 +45,8 @@ impl SystemParams {
 pub struct RuntimeConfig {
     pub ntt_enabled: bool,
     pub parallel_enabled: bool,
+    pub gpu_enabled: bool,
+    pub gpu_min_elements: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -48,6 +54,8 @@ impl Default for RuntimeConfig {
         Self {
             ntt_enabled: true,
             parallel_enabled: true,
+            gpu_enabled: true,
+            gpu_min_elements: 16_777_216,
         }
     }
 }
@@ -61,4 +69,29 @@ pub struct BenchRow {
     pub poly_fold_ms: f64,
     pub verify_us: f64,
     pub cross_term_size_bytes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SystemParams;
+
+    #[test]
+    fn validate_accepts_square_power_of_two_dims() {
+        let params = SystemParams {
+            vector_len: 1024,
+            poly_len: 1024,
+            ..SystemParams::default()
+        };
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_square_dims() {
+        let params = SystemParams {
+            vector_len: 2048,
+            poly_len: 1024,
+            ..SystemParams::default()
+        };
+        assert!(params.validate().is_err());
+    }
 }

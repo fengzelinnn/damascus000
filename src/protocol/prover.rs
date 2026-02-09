@@ -3,6 +3,7 @@ use crate::algebra::poly::Poly;
 use crate::commitment::sis::{ModuleCommitment, ModuleSisCommitter, SisParams};
 use crate::protocol::transcript::Transcript;
 use crate::utils::config::{RuntimeConfig, SystemParams};
+use crate::utils::gpu;
 use crate::utils::io;
 use anyhow::{anyhow, ensure, Context, Result};
 use rayon::prelude::*;
@@ -152,8 +153,22 @@ impl DamascusProver {
         );
         let alpha = self.transcript.challenge_alpha();
 
-        let folded_message = fold_poly_vectors(msg_left, msg_right, alpha)?;
-        let folded_blinding = fold_poly_vectors(rnd_left, rnd_right, alpha)?;
+        let folded_message = fold_poly_vectors(
+            msg_left,
+            msg_right,
+            alpha,
+            self.config.parallel_enabled,
+            self.config.gpu_enabled,
+            self.config.gpu_min_elements,
+        )?;
+        let folded_blinding = fold_poly_vectors(
+            rnd_left,
+            rnd_right,
+            alpha,
+            self.config.parallel_enabled,
+            self.config.gpu_enabled,
+            self.config.gpu_min_elements,
+        )?;
         let vector_fold_commitment =
             left_vector_commitment.add_scaled(&right_vector_commitment, alpha)?;
         self.transcript
@@ -161,8 +176,10 @@ impl DamascusProver {
         let vector_fold_time = vector_start.elapsed();
 
         let poly_start = Instant::now();
-        let (msg_even, msg_odd) = split_even_odd_vector(&folded_message);
-        let (rnd_even, rnd_odd) = split_even_odd_vector(&folded_blinding);
+        let (msg_even, msg_odd) =
+            split_even_odd_vector(&folded_message, self.config.parallel_enabled);
+        let (rnd_even, rnd_odd) =
+            split_even_odd_vector(&folded_blinding, self.config.parallel_enabled);
 
         ensure!(!msg_even.is_empty(), "even polynomial vector is empty");
         ensure!(
@@ -189,8 +206,22 @@ impl DamascusProver {
         );
         let beta = self.transcript.challenge_beta();
 
-        let next_message = fold_even_odd_pairs(msg_even, msg_odd, beta)?;
-        let next_blinding = fold_even_odd_pairs(rnd_even, rnd_odd, beta)?;
+        let next_message = fold_even_odd_pairs(
+            msg_even,
+            msg_odd,
+            beta,
+            self.config.parallel_enabled,
+            self.config.gpu_enabled,
+            self.config.gpu_min_elements,
+        )?;
+        let next_blinding = fold_even_odd_pairs(
+            rnd_even,
+            rnd_odd,
+            beta,
+            self.config.parallel_enabled,
+            self.config.gpu_enabled,
+            self.config.gpu_min_elements,
+        )?;
         let next_commitment = even_poly_commitment.add_scaled(&odd_poly_commitment, beta)?;
 
         let recomputed = self
@@ -276,46 +307,121 @@ impl DamascusProver {
         rnd_even: &[Poly],
         rnd_odd: &[Poly],
     ) -> Result<Fp> {
-        let mut acc = Fp::zero();
+        ensure!(
+            msg_even.len() == msg_odd.len(),
+            "msg even/odd vector length mismatch"
+        );
+        ensure!(
+            rnd_even.len() == rnd_odd.len(),
+            "rnd even/odd vector length mismatch"
+        );
 
-        for (even, odd) in msg_even.iter().zip(msg_odd) {
-            let prod = even.mul(odd, self.config.ntt_enabled)?;
-            acc += prod.coeffs.iter().copied().sum::<Fp>();
-        }
-        for (even, odd) in rnd_even.iter().zip(rnd_odd) {
-            let prod = even.mul(odd, self.config.ntt_enabled)?;
-            acc += prod.coeffs.iter().copied().sum::<Fp>();
-        }
+        let pair_sum = |lhs: &[Poly], rhs: &[Poly]| -> Fp {
+            if self.config.parallel_enabled {
+                lhs.par_iter()
+                    .zip(rhs.par_iter())
+                    .map(|(l, r)| l.coeff_sum() * r.coeff_sum())
+                    .reduce(|| Fp::zero(), |a, b| a + b)
+            } else {
+                lhs.iter()
+                    .zip(rhs)
+                    .map(|(l, r)| l.coeff_sum() * r.coeff_sum())
+                    .sum()
+            }
+        };
 
-        Ok(acc)
+        Ok(pair_sum(msg_even, msg_odd) + pair_sum(rnd_even, rnd_odd))
     }
 }
 
-fn fold_poly_vectors(left: &[Poly], right: &[Poly], challenge: Fp) -> Result<Vec<Poly>> {
+fn fold_poly_vectors(
+    left: &[Poly],
+    right: &[Poly],
+    challenge: Fp,
+    parallel_enabled: bool,
+    gpu_enabled: bool,
+    gpu_min_elements: usize,
+) -> Result<Vec<Poly>> {
     ensure!(left.len() == right.len(), "vector split length mismatch");
-    left.iter()
-        .zip(right)
-        .map(|(l, r)| l.add(&r.scale(challenge)))
-        .collect()
-}
 
-fn split_even_odd_vector(polys: &[Poly]) -> (Vec<Poly>, Vec<Poly>) {
-    let mut even = Vec::with_capacity(polys.len());
-    let mut odd = Vec::with_capacity(polys.len());
-    for poly in polys {
-        let (e, o) = poly.odd_even_decomposition();
-        even.push(e);
-        odd.push(o);
+    if left.is_empty() {
+        return Ok(Vec::new());
     }
-    (even, odd)
+
+    let poly_len = left[0].len();
+    ensure!(poly_len > 0, "empty polynomial is not allowed");
+    ensure!(
+        left.iter().all(|p| p.len() == poly_len) && right.iter().all(|p| p.len() == poly_len),
+        "inconsistent polynomial length in fold"
+    );
+
+    let total_elements = left.len().saturating_mul(poly_len);
+    let use_gpu = gpu_enabled && total_elements >= gpu_min_elements;
+    if use_gpu {
+        let mut left_flat = Vec::with_capacity(total_elements);
+        let mut right_flat = Vec::with_capacity(total_elements);
+        for poly in left {
+            left_flat.extend(poly.coeffs.iter().map(|c| c.as_u64()));
+        }
+        for poly in right {
+            right_flat.extend(poly.coeffs.iter().map(|c| c.as_u64()));
+        }
+
+        if let Some(out_flat) = gpu::try_fold_pairs_gpu(&left_flat, &right_flat, challenge.as_u64())
+        {
+            let mut out = Vec::with_capacity(left.len());
+            for chunk in out_flat.chunks_exact(poly_len) {
+                out.push(Poly::new(chunk.iter().map(|v| Fp(*v)).collect()));
+            }
+            return Ok(out);
+        }
+    }
+
+    if parallel_enabled {
+        left.par_iter()
+            .zip(right.par_iter())
+            .map(|(l, r)| l.add(&r.scale(challenge)))
+            .collect()
+    } else {
+        left.iter()
+            .zip(right)
+            .map(|(l, r)| l.add(&r.scale(challenge)))
+            .collect()
+    }
 }
 
-fn fold_even_odd_pairs(even: Vec<Poly>, odd: Vec<Poly>, beta: Fp) -> Result<Vec<Poly>> {
+fn split_even_odd_vector(polys: &[Poly], parallel_enabled: bool) -> (Vec<Poly>, Vec<Poly>) {
+    if parallel_enabled {
+        polys.par_iter().map(Poly::odd_even_decomposition).unzip()
+    } else {
+        let mut even = Vec::with_capacity(polys.len());
+        let mut odd = Vec::with_capacity(polys.len());
+        for poly in polys {
+            let (e, o) = poly.odd_even_decomposition();
+            even.push(e);
+            odd.push(o);
+        }
+        (even, odd)
+    }
+}
+
+fn fold_even_odd_pairs(
+    even: Vec<Poly>,
+    odd: Vec<Poly>,
+    beta: Fp,
+    parallel_enabled: bool,
+    gpu_enabled: bool,
+    gpu_min_elements: usize,
+) -> Result<Vec<Poly>> {
     ensure!(even.len() == odd.len(), "even/odd vector length mismatch");
-    even.into_iter()
-        .zip(odd)
-        .map(|(e, o)| e.add(&o.scale(beta)))
-        .collect()
+    fold_poly_vectors(
+        &even,
+        &odd,
+        beta,
+        parallel_enabled,
+        gpu_enabled,
+        gpu_min_elements,
+    )
 }
 
 fn floor_log2(x: usize) -> usize {

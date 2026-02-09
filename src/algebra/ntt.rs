@@ -1,5 +1,6 @@
 use crate::algebra::field::{Fp, GOLDILOCKS_MODULUS};
 use anyhow::{anyhow, ensure, Result};
+use rayon::prelude::*;
 use std::sync::OnceLock;
 
 const TWO_ADICITY: usize = 32;
@@ -8,9 +9,9 @@ const GENERATOR_FACTORS: [u64; 6] = [2, 3, 5, 17, 257, 65_537];
 #[derive(Clone, Debug)]
 pub struct NttPlan {
     size: usize,
-    root: Fp,
-    inv_root: Fp,
     inv_size: Fp,
+    stage_roots: Vec<Fp>,
+    inv_stage_roots: Vec<Fp>,
 }
 
 impl NttPlan {
@@ -22,11 +23,20 @@ impl NttPlan {
         );
 
         let root = primitive_root_of_unity(size)?;
+        let mut stage_roots = Vec::new();
+        let mut inv_stage_roots = Vec::new();
+        let mut len = 2usize;
+        while len <= size {
+            stage_roots.push(root.pow((size / len) as u64));
+            inv_stage_roots.push(root.inv().pow((size / len) as u64));
+            len <<= 1;
+        }
+
         Ok(Self {
             size,
-            root,
-            inv_root: root.inv(),
             inv_size: Fp::from(size as u64).inv(),
+            stage_roots,
+            inv_stage_roots,
         })
     }
 
@@ -69,17 +79,14 @@ pub fn forward_ntt(values: &mut [Fp], plan: &NttPlan) -> Result<()> {
     bit_reverse_permute(values);
 
     let mut len = 2usize;
-    while len <= plan.size {
-        let wlen = plan.root.pow((plan.size / len) as u64);
-        for chunk in values.chunks_exact_mut(len) {
-            let (left, right) = chunk.split_at_mut(len / 2);
-            let mut w = Fp::one();
-            for (u, v) in left.iter_mut().zip(right.iter_mut()) {
-                let t = *v * w;
-                let x = *u;
-                *u = x + t;
-                *v = x - t;
-                w *= wlen;
+    for &wlen in &plan.stage_roots {
+        if values.len() / len >= rayon::current_num_threads().saturating_mul(2) {
+            values.par_chunks_exact_mut(len).for_each(|chunk| {
+                butterfly_chunk(chunk, wlen);
+            });
+        } else {
+            for chunk in values.chunks_exact_mut(len) {
+                butterfly_chunk(chunk, wlen);
             }
         }
         len <<= 1;
@@ -96,17 +103,14 @@ pub fn inverse_ntt(values: &mut [Fp], plan: &NttPlan) -> Result<()> {
     bit_reverse_permute(values);
 
     let mut len = 2usize;
-    while len <= plan.size {
-        let wlen = plan.inv_root.pow((plan.size / len) as u64);
-        for chunk in values.chunks_exact_mut(len) {
-            let (left, right) = chunk.split_at_mut(len / 2);
-            let mut w = Fp::one();
-            for (u, v) in left.iter_mut().zip(right.iter_mut()) {
-                let t = *v * w;
-                let x = *u;
-                *u = x + t;
-                *v = x - t;
-                w *= wlen;
+    for &wlen in &plan.inv_stage_roots {
+        if values.len() / len >= rayon::current_num_threads().saturating_mul(2) {
+            values.par_chunks_exact_mut(len).for_each(|chunk| {
+                butterfly_chunk(chunk, wlen);
+            });
+        } else {
+            for chunk in values.chunks_exact_mut(len) {
+                butterfly_chunk(chunk, wlen);
             }
         }
         len <<= 1;
@@ -117,6 +121,20 @@ pub fn inverse_ntt(values: &mut [Fp], plan: &NttPlan) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[inline]
+fn butterfly_chunk(chunk: &mut [Fp], wlen: Fp) {
+    let len = chunk.len();
+    let (left, right) = chunk.split_at_mut(len / 2);
+    let mut w = Fp::one();
+    for (u, v) in left.iter_mut().zip(right.iter_mut()) {
+        let t = *v * w;
+        let x = *u;
+        *u = x + t;
+        *v = x - t;
+        w *= wlen;
+    }
 }
 
 fn primitive_root_of_unity(size: usize) -> Result<Fp> {

@@ -74,6 +74,8 @@ fn run_single_scenario(file_path: &Path, label: &str, ntt_enabled: bool) -> Resu
     let runtime = RuntimeConfig {
         ntt_enabled,
         parallel_enabled: true,
+        gpu_enabled: false,
+        gpu_min_elements: 262_144,
     };
 
     let preprocess_start = std::time::Instant::now();

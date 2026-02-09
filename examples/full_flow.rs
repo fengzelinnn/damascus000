@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use damascus_core::utils::gpu;
 use damascus_core::{DamascusProver, DamascusVerifier, RuntimeConfig, SystemParams};
 use std::env;
 use std::fs;
@@ -18,9 +19,16 @@ fn main() -> Result<()> {
     let params = params_from_layout(&derived);
 
     let ntt_enabled = env::var("DAMASCUS_NTT").map(|v| v != "0").unwrap_or(true);
+    let gpu_enabled = env::var("DAMASCUS_GPU").map(|v| v != "0").unwrap_or(true);
+    let gpu_min_elements = env::var("DAMASCUS_GPU_MIN_ELEMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16_777_216);
     let runtime = RuntimeConfig {
         ntt_enabled,
         parallel_enabled: true,
+        gpu_enabled,
+        gpu_min_elements,
     };
 
     println!("input: {}", file_path.display());
@@ -35,7 +43,7 @@ fn main() -> Result<()> {
     );
     if derived.capped_by_max_vector {
         println!(
-            "note: vector_len capped at {} (set DAMASCUS_MAX_VECTOR_LEN to adjust)",
+            "note: tensor dimension capped at {} (set DAMASCUS_MAX_TENSOR_DIM to adjust; DAMASCUS_MAX_VECTOR_LEN is still supported)",
             derived.max_vector_len
         );
     }
@@ -51,6 +59,15 @@ fn main() -> Result<()> {
     );
     println!("rounds: {}", prover.rounds_total());
     println!("ntt_enabled: {}", ntt_enabled);
+    println!("gpu_enabled: {}", gpu_enabled);
+    println!("gpu_min_elements: {}", gpu_min_elements);
+    let gpu_info = gpu::cuda_device_info();
+    println!(
+        "gpu_probe: available={} compiled_backend={} detail={}",
+        gpu_info.available,
+        gpu::cuda_backend_ready(),
+        gpu_info.summary
+    );
 
     let mut total_fold_ms = 0.0;
     let mut total_verify_ms = 0.0;
@@ -130,20 +147,26 @@ fn derive_layout(input_size_bytes: u64) -> DerivedLayout {
         .filter(|v| *v > 0)
         .unwrap_or(1024);
     let raw_poly_len = configured_poly;
-    let poly_len = pad_pow2(raw_poly_len.max(2));
+    let padded_poly_len = pad_pow2(raw_poly_len.max(2));
 
     // Vector count grows with file size, then gets padded to power-of-two.
-    let raw_vector_len = words.div_ceil(poly_len).max(2);
+    let raw_vector_len = words.div_ceil(padded_poly_len).max(2);
     let padded_vector_len = pad_pow2(raw_vector_len);
-    let configured_max_vector = env::var("DAMASCUS_MAX_VECTOR_LEN")
+    let configured_max_vector = env::var("DAMASCUS_MAX_TENSOR_DIM")
         .ok()
+        .or_else(|| env::var("DAMASCUS_MAX_VECTOR_LEN").ok())
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v >= 2)
         .unwrap_or(16_384);
     let max_vector_len = floor_pow2(configured_max_vector).max(2);
-    let capped_by_max_vector = padded_vector_len > max_vector_len;
-    let vector_len = padded_vector_len.min(max_vector_len);
-    let rounds = floor_log2(vector_len.min(poly_len));
+    // Preprocessing uses a logical square tensor:
+    // both dimensions are padded to power-of-two and then unified.
+    let padded_square_len = padded_vector_len.max(padded_poly_len);
+    let capped_by_max_vector = padded_square_len > max_vector_len;
+    let square_len = padded_square_len.min(max_vector_len);
+    let vector_len = square_len;
+    let poly_len = square_len;
+    let rounds = floor_log2(square_len);
 
     DerivedLayout {
         raw_vector_len,

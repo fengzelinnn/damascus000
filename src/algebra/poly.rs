@@ -86,6 +86,10 @@ impl Poly {
             .sum())
     }
 
+    pub fn coeff_sum(&self) -> Fp {
+        self.coeffs.iter().copied().sum()
+    }
+
     pub fn mul(&self, rhs: &Self, ntt_enabled: bool) -> Result<Self> {
         ensure!(
             !self.is_empty() && !rhs.is_empty(),
