@@ -108,12 +108,27 @@ fn collect_benchmark_data() -> Result<BenchmarkRun> {
     let mut verify_scenarios = Vec::new();
     let mut summary_rows = Vec::new();
     let mut stage_rows = Vec::new();
+    let total_scenarios = files.len() * 4;
+    let mut scenario_idx = 0usize;
+
+    eprintln!(
+        "[bench] resolved {} input file(s), {} scenario(s) total",
+        files.len(),
+        total_scenarios
+    );
 
     for file_path in files {
         for ntt_enabled in [true, false] {
             for gpu_enabled in [true, false] {
-                let outcome =
-                    run_single_scenario(&file_path, ntt_enabled, gpu_enabled, gpu_min_elements)?;
+                scenario_idx += 1;
+                let outcome = run_single_scenario(
+                    &file_path,
+                    ntt_enabled,
+                    gpu_enabled,
+                    gpu_min_elements,
+                    scenario_idx,
+                    total_scenarios,
+                )?;
                 verify_scenarios.push(outcome.verify_scenario);
                 summary_rows.push(outcome.summary_row);
                 stage_rows.extend(outcome.stage_rows);
@@ -133,6 +148,8 @@ fn run_single_scenario(
     ntt_enabled: bool,
     gpu_enabled: bool,
     gpu_min_elements: usize,
+    scenario_idx: usize,
+    total_scenarios: usize,
 ) -> Result<ScenarioOutcome> {
     let file_meta = fs::metadata(file_path)
         .with_context(|| format!("read metadata for {}", file_path.display()))?;
@@ -157,21 +174,36 @@ fn run_single_scenario(
         gpu_mode.to_lowercase()
     );
     eprintln!(
-        "[bench] scenario={} file={} size={} ntt={} gpu={}",
+        "[bench] scenario={}/{} id={} file={} size={} ntt={} gpu={}",
+        scenario_idx,
+        total_scenarios,
         scenario_id,
         file_path.display(),
         file_size_bytes,
         ntt_mode,
         gpu_mode
     );
+    eprintln!(
+        "[bench] {} {} preprocess start",
+        scenario_id,
+        progress_bar(0, 1, 24)
+    );
 
     let preprocess_start = Instant::now();
     let mut prover = DamascusProver::initialize_with_config(file_path, params.clone(), runtime)
         .with_context(|| format!("initialize prover for {}", file_path.display()))?;
     let preprocess_duration = preprocess_start.elapsed();
+    eprintln!(
+        "[bench] {} {} preprocess done ({:.3} ms, {:.3} MiB/s)",
+        scenario_id,
+        progress_bar(1, 1, 24),
+        ms(preprocess_duration),
+        throughput_mib_per_s(file_size_bytes, preprocess_duration)
+    );
 
     let initial_commitment = prover.current_commitment().clone();
     let mut verifier = DamascusVerifier::new(params.clone(), initial_commitment.clone());
+    let total_rounds = prover.rounds_total();
 
     let mut rows = Vec::new();
     rows.push(stage_row(
@@ -195,24 +227,72 @@ fn run_single_scenario(
     let mut fold_total_bytes = 0u64;
     let mut verify_total_duration = Duration::ZERO;
     let mut verify_payload_bytes = 0u64;
+    let scenario_cross_term_domain = resolve_cross_term_domain_for_bench(params.poly_len);
+    let mut completed_round_steps = 0usize;
+    let total_round_steps = total_rounds * 2;
 
-    for round in 0..prover.rounds_total() {
+    for round in 0..total_rounds {
+        eprintln!(
+            "[bench] {} {} round {}/{} fold start (vector_len={}, poly_len={})",
+            scenario_id,
+            progress_bar(completed_round_steps, total_round_steps, 24),
+            round + 1,
+            total_rounds,
+            round_vector_len,
+            round_poly_len
+        );
         let round_output = prover
             .fold_round(round)
             .with_context(|| format!("fold round {}", round))?;
+        completed_round_steps += 1;
 
         let verify_start = Instant::now();
         verifier
             .update_commitment(&round_output.micro_block)
             .with_context(|| format!("verify round {}", round))?;
         let verify_duration = verify_start.elapsed();
+        completed_round_steps += 1;
 
-        let vector_stage_bytes = logical_tensor_bytes(round_vector_len, round_poly_len)?;
-        let poly_stage_bytes = logical_tensor_bytes(round_vector_len / 2, round_poly_len)?;
+        let vector_stage_bytes = vector_stage_processed_bytes(
+            round_vector_len,
+            round_poly_len,
+            scenario_cross_term_domain,
+            ntt_enabled,
+        )?;
+        let poly_stage_bytes = poly_stage_processed_bytes(
+            round_vector_len,
+            round_poly_len,
+            scenario_cross_term_domain,
+            ntt_enabled,
+        )?;
         let fold_round_bytes = vector_stage_bytes.saturating_add(poly_stage_bytes);
         let payload_bytes = bincode::serialize(&round_output.micro_block)
             .context("serialize micro-block")?
             .len() as u64;
+
+        eprintln!(
+            "[bench] {} {} round {}/{} fold done: vec={:.3}ms ({:.3} MiB/s), poly={:.3}ms ({:.3} MiB/s), total={:.3}ms ({:.3} MiB/s)",
+            scenario_id,
+            progress_bar(completed_round_steps, total_round_steps, 24),
+            round + 1,
+            total_rounds,
+            ms(round_output.vector_fold_time),
+            throughput_mib_per_s(vector_stage_bytes, round_output.vector_fold_time),
+            ms(round_output.poly_fold_time),
+            throughput_mib_per_s(poly_stage_bytes, round_output.poly_fold_time),
+            ms(round_output.total_round_time),
+            throughput_mib_per_s(fold_round_bytes, round_output.total_round_time),
+        );
+        eprintln!(
+            "[bench] {} {} round {}/{} verify done: {:.3}ms payload={}B ({:.3} MiB/s)",
+            scenario_id,
+            progress_bar(completed_round_steps, total_round_steps, 24),
+            round + 1,
+            total_rounds,
+            ms(verify_duration),
+            payload_bytes,
+            throughput_mib_per_s(payload_bytes, verify_duration)
+        );
 
         rows.push(stage_row(
             &scenario_id,
@@ -304,6 +384,14 @@ fn run_single_scenario(
         total_measured_bytes,
         overall_mib_s: throughput_mib_per_s(total_measured_bytes, end_to_end_duration),
     };
+    eprintln!(
+        "[bench] {} scenario done: preprocess={:.3}ms, fold={:.3}ms, verify={:.3}ms, overall={:.3} MiB/s",
+        scenario_id,
+        summary.preprocess_ms,
+        summary.fold_total_ms,
+        summary.verify_total_ms,
+        summary.overall_mib_s
+    );
 
     Ok(ScenarioOutcome {
         verify_scenario: VerifyScenario {
@@ -520,6 +608,75 @@ fn logical_tensor_bytes(vector_len: usize, poly_len: usize) -> Result<u64> {
     u64::try_from(bytes).map_err(|_| anyhow!("tensor bytes exceed u64"))
 }
 
+fn vector_stage_processed_bytes(
+    vector_len: usize,
+    poly_len: usize,
+    cross_term_domain: usize,
+    ntt_enabled: bool,
+) -> Result<u64> {
+    // Vector fold handles both witness tracks (message + blinding).
+    let fold_bytes_one_track = logical_tensor_bytes(vector_len, poly_len)?;
+    let fold_bytes = fold_bytes_one_track.saturating_mul(2);
+    let domain = active_cross_term_domain(cross_term_domain, poly_len);
+    let cross_term_bytes = cross_term_processed_bytes(domain, ntt_enabled)?;
+    Ok(fold_bytes.saturating_add(cross_term_bytes))
+}
+
+fn poly_stage_processed_bytes(
+    vector_len: usize,
+    poly_len: usize,
+    cross_term_domain: usize,
+    ntt_enabled: bool,
+) -> Result<u64> {
+    // Odd/even fold runs after vector fold, so vector_len and poly_len are halved.
+    let next_vector_len = vector_len / 2;
+    let fold_bytes_one_track = logical_tensor_bytes(next_vector_len, poly_len)?;
+    let fold_bytes = fold_bytes_one_track.saturating_mul(2);
+    let domain = active_cross_term_domain(cross_term_domain, poly_len / 2);
+    let cross_term_bytes = cross_term_processed_bytes(domain, ntt_enabled)?;
+    Ok(fold_bytes.saturating_add(cross_term_bytes))
+}
+
+fn resolve_cross_term_domain_for_bench(poly_len: usize) -> usize {
+    let configured = env::var("DAMASCUS_CROSS_TERM_DOMAIN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 64)
+        .unwrap_or(2048);
+    floor_pow2(configured.min(poly_len)).max(1)
+}
+
+fn active_cross_term_domain(base_domain: usize, stage_poly_len: usize) -> usize {
+    floor_pow2(base_domain.min(stage_poly_len)).max(1)
+}
+
+fn cross_term_processed_bytes(domain: usize, ntt_enabled: bool) -> Result<u64> {
+    // Two spectral evaluations (message + blinding), each consuming lhs+rhs signatures.
+    let effective_signal_len = if ntt_enabled {
+        ntt_convolution_len(domain)?
+    } else {
+        domain
+    };
+    let elements = (effective_signal_len as u128)
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("cross-term element count overflow"))?;
+    let bytes = elements
+        .checked_mul(8)
+        .ok_or_else(|| anyhow!("cross-term byte count overflow"))?;
+    u64::try_from(bytes).map_err(|_| anyhow!("cross-term bytes exceed u64"))
+}
+
+fn ntt_convolution_len(domain: usize) -> Result<usize> {
+    if domain <= 1 {
+        return Ok(1);
+    }
+    let out_len = domain
+        .checked_mul(2)
+        .and_then(|v| v.checked_sub(1))
+        .ok_or_else(|| anyhow!("NTT output length overflow for domain {}", domain))?;
+    Ok(out_len.next_power_of_two())
+}
+
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
@@ -566,6 +723,27 @@ fn human_size(bytes: u64) -> String {
         unit_idx += 1;
     }
     format!("{value:.2} {}", UNITS[unit_idx])
+}
+
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    let safe_total = total.max(1);
+    let clamped_done = done.min(safe_total);
+    let filled = (clamped_done * width) / safe_total;
+    let mut bar = String::with_capacity(width + 24);
+    bar.push('[');
+    for i in 0..width {
+        if i < filled {
+            bar.push('=');
+        } else if i == filled && clamped_done < safe_total {
+            bar.push('>');
+        } else {
+            bar.push('.');
+        }
+    }
+    bar.push(']');
+    bar.push(' ');
+    bar.push_str(&format!("{}/{}", clamped_done, safe_total));
+    bar
 }
 
 #[derive(Clone, Copy, Debug)]

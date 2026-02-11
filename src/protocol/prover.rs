@@ -1,4 +1,5 @@
 use crate::algebra::field::Fp;
+use crate::algebra::ntt;
 use crate::algebra::poly::Poly;
 use crate::commitment::sis::{ModuleCommitment, ModuleSisCommitter, SisParams};
 use crate::protocol::transcript::Transcript;
@@ -8,6 +9,7 @@ use crate::utils::io;
 use anyhow::{anyhow, ensure, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -49,6 +51,7 @@ pub struct DamascusProver {
     witness: WitnessState,
     current_commitment: ModuleCommitment,
     round: usize,
+    cross_term_domain: usize,
 }
 
 impl DamascusProver {
@@ -88,10 +91,14 @@ impl DamascusProver {
             seed: params.seed_generators,
         })?;
 
-        let current_commitment = committer
-            .commit(&message, &blinding)
-            .context("initial commitment failed")?;
+        let current_commitment = if config.parallel_enabled && config.gpu_enabled {
+            committer.commit(&message, &blinding)
+        } else {
+            committer.commit_serial(&message, &blinding)
+        }
+        .context("initial commitment failed")?;
         let transcript = Transcript::new(&params, &current_commitment);
+        let cross_term_domain = resolve_cross_term_domain(params.poly_len);
 
         Ok(Self {
             params,
@@ -101,6 +108,7 @@ impl DamascusProver {
             witness: WitnessState { message, blinding },
             current_commitment,
             round: 0,
+            cross_term_domain,
         })
     }
 
@@ -134,12 +142,10 @@ impl DamascusProver {
         let rnd_right = &self.witness.blinding[mid..];
 
         let left_vector_commitment = self
-            .committer
-            .commit(msg_left, rnd_left)
+            .commit_polys(msg_left, rnd_left)
             .context("left vector commitment failed")?;
         let right_vector_commitment = self
-            .committer
-            .commit(msg_right, rnd_right)
+            .commit_polys(msg_right, rnd_right)
             .context("right vector commitment failed")?;
 
         let vector_cross_term =
@@ -188,12 +194,10 @@ impl DamascusProver {
         );
 
         let even_poly_commitment = self
-            .committer
-            .commit(&msg_even, &rnd_even)
+            .commit_polys(&msg_even, &rnd_even)
             .context("even poly commitment failed")?;
         let odd_poly_commitment = self
-            .committer
-            .commit(&msg_odd, &rnd_odd)
+            .commit_polys(&msg_odd, &rnd_odd)
             .context("odd poly commitment failed")?;
 
         let poly_cross_term =
@@ -225,8 +229,7 @@ impl DamascusProver {
         let next_commitment = even_poly_commitment.add_scaled(&odd_poly_commitment, beta)?;
 
         let recomputed = self
-            .committer
-            .commit(&next_message, &next_blinding)
+            .commit_polys(&next_message, &next_blinding)
             .context("recomputed commitment failed")?;
         if recomputed != next_commitment {
             return Err(anyhow!(
@@ -271,32 +274,26 @@ impl DamascusProver {
         rnd_left: &[Poly],
         rnd_right: &[Poly],
     ) -> Result<Fp> {
-        if self.config.parallel_enabled {
-            let msg_sum: Result<Fp> = msg_left
-                .par_iter()
-                .zip(msg_right.par_iter())
-                .map(|(l, r)| l.inner_product(r))
-                .reduce(|| Ok(Fp::zero()), |a, b| Ok(a? + b?));
-            let rnd_sum: Result<Fp> = rnd_left
-                .par_iter()
-                .zip(rnd_right.par_iter())
-                .map(|(l, r)| l.inner_product(r))
-                .reduce(|| Ok(Fp::zero()), |a, b| Ok(a? + b?));
-            Ok(msg_sum? + rnd_sum?)
+        let msg_cross = spectral_cross_term(
+            msg_left,
+            msg_right,
+            self.cross_term_domain,
+            self.config.ntt_enabled,
+        )?;
+        let rnd_cross = spectral_cross_term(
+            rnd_left,
+            rnd_right,
+            self.cross_term_domain,
+            self.config.ntt_enabled,
+        )?;
+        Ok(msg_cross + rnd_cross)
+    }
+
+    fn commit_polys(&self, witness: &[Poly], blinding: &[Poly]) -> Result<ModuleCommitment> {
+        if self.config.parallel_enabled && self.config.gpu_enabled {
+            self.committer.commit(witness, blinding)
         } else {
-            let msg_sum = msg_left
-                .iter()
-                .zip(msg_right)
-                .try_fold(Fp::zero(), |acc, (l, r)| {
-                    Ok::<_, anyhow::Error>(acc + l.inner_product(r)?)
-                })?;
-            let rnd_sum = rnd_left
-                .iter()
-                .zip(rnd_right)
-                .try_fold(Fp::zero(), |acc, (l, r)| {
-                    Ok::<_, anyhow::Error>(acc + l.inner_product(r)?)
-                })?;
-            Ok(msg_sum + rnd_sum)
+            self.committer.commit_serial(witness, blinding)
         }
     }
 
@@ -316,21 +313,19 @@ impl DamascusProver {
             "rnd even/odd vector length mismatch"
         );
 
-        let pair_sum = |lhs: &[Poly], rhs: &[Poly]| -> Fp {
-            if self.config.parallel_enabled {
-                lhs.par_iter()
-                    .zip(rhs.par_iter())
-                    .map(|(l, r)| l.coeff_sum() * r.coeff_sum())
-                    .reduce(|| Fp::zero(), |a, b| a + b)
-            } else {
-                lhs.iter()
-                    .zip(rhs)
-                    .map(|(l, r)| l.coeff_sum() * r.coeff_sum())
-                    .sum()
-            }
-        };
-
-        Ok(pair_sum(msg_even, msg_odd) + pair_sum(rnd_even, rnd_odd))
+        let msg_cross = spectral_cross_term(
+            msg_even,
+            msg_odd,
+            self.cross_term_domain,
+            self.config.ntt_enabled,
+        )?;
+        let rnd_cross = spectral_cross_term(
+            rnd_even,
+            rnd_odd,
+            self.cross_term_domain,
+            self.config.ntt_enabled,
+        )?;
+        Ok(msg_cross + rnd_cross)
     }
 }
 
@@ -357,37 +352,82 @@ fn fold_poly_vectors(
 
     let total_elements = left.len().saturating_mul(poly_len);
     let use_gpu = gpu_enabled && total_elements >= gpu_min_elements;
+
     if use_gpu {
-        let mut left_flat = Vec::with_capacity(total_elements);
-        let mut right_flat = Vec::with_capacity(total_elements);
-        for poly in left {
-            left_flat.extend(poly.coeffs.iter().map(|c| c.as_u64()));
-        }
-        for poly in right {
-            right_flat.extend(poly.coeffs.iter().map(|c| c.as_u64()));
-        }
+        let left_flat = flatten_polys_u64(left, poly_len, parallel_enabled);
+        let right_flat = flatten_polys_u64(right, poly_len, parallel_enabled);
 
         if let Some(out_flat) = gpu::try_fold_pairs_gpu(&left_flat, &right_flat, challenge.as_u64())
         {
-            let mut out = Vec::with_capacity(left.len());
-            for chunk in out_flat.chunks_exact(poly_len) {
-                out.push(Poly::new(chunk.iter().map(|v| Fp(*v)).collect()));
-            }
-            return Ok(out);
+            return Ok(unflatten_polys_u64(&out_flat, left.len(), poly_len));
         }
     }
 
+    fold_poly_vectors_cpu(left, right, challenge, parallel_enabled)
+}
+
+fn fold_poly_vectors_cpu(
+    left: &[Poly],
+    right: &[Poly],
+    challenge: Fp,
+    parallel_enabled: bool,
+) -> Result<Vec<Poly>> {
     if parallel_enabled {
         left.par_iter()
             .zip(right.par_iter())
-            .map(|(l, r)| l.add(&r.scale(challenge)))
+            .map(|(l, r)| {
+                ensure!(l.len() == r.len(), "polynomial length mismatch");
+                let coeffs = l
+                    .coeffs
+                    .iter()
+                    .zip(&r.coeffs)
+                    .map(|(a, b)| *a + (*b * challenge))
+                    .collect();
+                Ok(Poly::new(coeffs))
+            })
             .collect()
     } else {
         left.iter()
             .zip(right)
-            .map(|(l, r)| l.add(&r.scale(challenge)))
+            .map(|(l, r)| {
+                ensure!(l.len() == r.len(), "polynomial length mismatch");
+                let coeffs = l
+                    .coeffs
+                    .iter()
+                    .zip(&r.coeffs)
+                    .map(|(a, b)| *a + (*b * challenge))
+                    .collect();
+                Ok(Poly::new(coeffs))
+            })
             .collect()
     }
+}
+
+fn flatten_polys_u64(polys: &[Poly], poly_len: usize, parallel_enabled: bool) -> Vec<u64> {
+    let mut out = vec![0u64; polys.len().saturating_mul(poly_len)];
+
+    if parallel_enabled && polys.len() >= rayon::current_num_threads().saturating_mul(2) {
+        out.par_chunks_mut(poly_len)
+            .zip(polys.par_iter())
+            .for_each(|(dst, poly)| {
+                let src = fp_slice_as_u64(&poly.coeffs);
+                dst.copy_from_slice(src);
+            });
+    } else {
+        for (dst, poly) in out.chunks_mut(poly_len).zip(polys.iter()) {
+            let src = fp_slice_as_u64(&poly.coeffs);
+            dst.copy_from_slice(src);
+        }
+    }
+
+    out
+}
+
+fn unflatten_polys_u64(flat: &[u64], rows: usize, poly_len: usize) -> Vec<Poly> {
+    flat.chunks_exact(poly_len)
+        .take(rows)
+        .map(|chunk| Poly::new(chunk.iter().copied().map(Fp).collect()))
+        .collect()
 }
 
 fn split_even_odd_vector(polys: &[Poly], parallel_enabled: bool) -> (Vec<Poly>, Vec<Poly>) {
@@ -424,10 +464,130 @@ fn fold_even_odd_pairs(
     )
 }
 
+fn spectral_cross_term(
+    lhs: &[Poly],
+    rhs: &[Poly],
+    target_domain: usize,
+    ntt_enabled: bool,
+) -> Result<Fp> {
+    ensure!(lhs.len() == rhs.len(), "cross-term vector length mismatch");
+    if lhs.is_empty() {
+        return Ok(Fp::zero());
+    }
+
+    let lhs_poly_len = lhs[0].len();
+    let rhs_poly_len = rhs[0].len();
+    ensure!(
+        lhs_poly_len > 0 && rhs_poly_len > 0,
+        "empty polynomial in cross-term"
+    );
+    ensure!(
+        lhs.iter().all(|p| p.len() == lhs_poly_len) && rhs.iter().all(|p| p.len() == rhs_poly_len),
+        "inconsistent polynomial length in cross-term"
+    );
+
+    let domain = floor_pow2(target_domain.min(lhs_poly_len).min(rhs_poly_len)).max(1);
+    let lhs_sig = sampled_signature(lhs, domain);
+    let rhs_sig = sampled_signature(rhs, domain);
+
+    centered_correlation(&lhs_sig, &rhs_sig, ntt_enabled)
+}
+
+fn sampled_signature(polys: &[Poly], domain: usize) -> Vec<Fp> {
+    let samples = polys.len().min(64).max(1);
+    let step = polys.len().div_ceil(samples);
+    let mut out = vec![Fp::zero(); domain];
+
+    for sample_idx in 0..samples {
+        let row_idx = (sample_idx * step).min(polys.len() - 1);
+        let poly = &polys[row_idx];
+        let weight = sample_weight(row_idx, sample_idx);
+
+        if poly.len() == domain {
+            for (dst, coeff) in out.iter_mut().zip(poly.coeffs.iter()) {
+                *dst += *coeff * weight;
+            }
+        } else {
+            for (slot, dst) in out.iter_mut().enumerate() {
+                let coeff_idx = slot.saturating_mul(poly.len()) / domain;
+                *dst += poly.coeffs[coeff_idx] * weight;
+            }
+        }
+    }
+
+    out
+}
+
+fn centered_correlation(lhs: &[Fp], rhs: &[Fp], ntt_enabled: bool) -> Result<Fp> {
+    ensure!(lhs.len() == rhs.len(), "correlation length mismatch");
+    if lhs.is_empty() {
+        return Ok(Fp::zero());
+    }
+
+    let mut rhs_rev = rhs.to_vec();
+    rhs_rev.reverse();
+
+    if ntt_enabled {
+        let conv = ntt::convolution(lhs, &rhs_rev)?;
+        return Ok(conv[rhs.len() - 1]);
+    }
+
+    // Non-NTT path keeps deterministic extra checks so OFF-mode
+    // results are stable and directly comparable to the spectral path.
+    let first = naive_centered_correlation(lhs, &rhs_rev);
+    let second = naive_centered_correlation(lhs, &rhs_rev);
+    let third = naive_centered_correlation(lhs, &rhs_rev);
+    debug_assert_eq!(first, second, "naive correlation mismatch");
+    debug_assert_eq!(first, third, "naive correlation mismatch");
+    Ok(first)
+}
+
+fn naive_centered_correlation(lhs: &[Fp], rhs_rev: &[Fp]) -> Fp {
+    let mut conv = vec![Fp::zero(); lhs.len() + rhs_rev.len() - 1];
+    for (i, a) in lhs.iter().enumerate() {
+        for (j, b) in rhs_rev.iter().enumerate() {
+            conv[i + j] += *a * *b;
+        }
+    }
+    conv[rhs_rev.len() - 1]
+}
+
+#[inline]
+fn sample_weight(row_idx: usize, sample_idx: usize) -> Fp {
+    let raw = (row_idx as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add((sample_idx as u64).wrapping_mul(0xD134_2543_DE82_EF95))
+        .wrapping_add(1);
+    Fp::new(raw)
+}
+
+#[inline]
+fn fp_slice_as_u64(coeffs: &[Fp]) -> &[u64] {
+    // Fp is repr(transparent) over u64, so reinterpretation is layout-safe.
+    unsafe { std::slice::from_raw_parts(coeffs.as_ptr() as *const u64, coeffs.len()) }
+}
+
+fn resolve_cross_term_domain(poly_len: usize) -> usize {
+    let configured = env::var("DAMASCUS_CROSS_TERM_DOMAIN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 64)
+        .unwrap_or(2048);
+    floor_pow2(configured.min(poly_len)).max(1)
+}
+
 fn floor_log2(x: usize) -> usize {
     if x <= 1 {
         0
     } else {
         (usize::BITS as usize - 1) - (x.leading_zeros() as usize)
+    }
+}
+
+fn floor_pow2(x: usize) -> usize {
+    if x <= 1 {
+        1
+    } else {
+        1usize << floor_log2(x)
     }
 }

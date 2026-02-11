@@ -1,7 +1,8 @@
 use crate::algebra::field::{Fp, GOLDILOCKS_MODULUS};
 use anyhow::{anyhow, ensure, Result};
 use rayon::prelude::*;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const TWO_ADICITY: usize = 32;
 const GENERATOR_FACTORS: [u64; 6] = [2, 3, 5, 17, 257, 65_537];
@@ -12,6 +13,7 @@ pub struct NttPlan {
     inv_size: Fp,
     stage_roots: Vec<Fp>,
     inv_stage_roots: Vec<Fp>,
+    bitrev: Vec<usize>,
 }
 
 impl NttPlan {
@@ -23,12 +25,13 @@ impl NttPlan {
         );
 
         let root = primitive_root_of_unity(size)?;
+        let inv_root = root.inv();
         let mut stage_roots = Vec::new();
         let mut inv_stage_roots = Vec::new();
         let mut len = 2usize;
         while len <= size {
             stage_roots.push(root.pow((size / len) as u64));
-            inv_stage_roots.push(root.inv().pow((size / len) as u64));
+            inv_stage_roots.push(inv_root.pow((size / len) as u64));
             len <<= 1;
         }
 
@@ -37,6 +40,7 @@ impl NttPlan {
             inv_size: Fp::from(size as u64).inv(),
             stage_roots,
             inv_stage_roots,
+            bitrev: build_bitrev_table(size),
         })
     }
 
@@ -58,7 +62,7 @@ pub fn convolution(a: &[Fp], b: &[Fp]) -> Result<Vec<Fp>> {
     fa[..a.len()].copy_from_slice(a);
     fb[..b.len()].copy_from_slice(b);
 
-    let plan = NttPlan::new(n)?;
+    let plan = cached_plan(n)?;
     forward_ntt(&mut fa, &plan)?;
     forward_ntt(&mut fb, &plan)?;
 
@@ -76,7 +80,7 @@ pub fn forward_ntt(values: &mut [Fp], plan: &NttPlan) -> Result<()> {
         values.len() == plan.size,
         "NTT input length must match plan"
     );
-    bit_reverse_permute(values);
+    bit_reverse_permute(values, &plan.bitrev);
 
     let mut len = 2usize;
     for &wlen in &plan.stage_roots {
@@ -100,7 +104,7 @@ pub fn inverse_ntt(values: &mut [Fp], plan: &NttPlan) -> Result<()> {
         values.len() == plan.size,
         "NTT input length must match plan"
     );
-    bit_reverse_permute(values);
+    bit_reverse_permute(values, &plan.bitrev);
 
     let mut len = 2usize;
     for &wlen in &plan.inv_stage_roots {
@@ -137,6 +141,23 @@ fn butterfly_chunk(chunk: &mut [Fp], wlen: Fp) {
     }
 }
 
+fn cached_plan(size: usize) -> Result<Arc<NttPlan>> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<NttPlan>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    {
+        let guard = cache.lock().expect("NTT cache lock poisoned");
+        if let Some(plan) = guard.get(&size) {
+            return Ok(Arc::clone(plan));
+        }
+    }
+
+    let new_plan = Arc::new(NttPlan::new(size)?);
+    let mut guard = cache.lock().expect("NTT cache lock poisoned");
+    let entry = guard.entry(size).or_insert_with(|| Arc::clone(&new_plan));
+    Ok(Arc::clone(entry))
+}
+
 fn primitive_root_of_unity(size: usize) -> Result<Fp> {
     ensure!(size.is_power_of_two(), "size must be a power of two");
     let generator = multiplicative_generator();
@@ -171,16 +192,15 @@ fn multiplicative_generator() -> Fp {
     })
 }
 
-fn bit_reverse_permute(values: &mut [Fp]) {
-    let n = values.len();
-    let mut j = 0usize;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j ^= bit;
+fn build_bitrev_table(n: usize) -> Vec<usize> {
+    let bits = n.trailing_zeros();
+    (0..n)
+        .map(|idx| (idx.reverse_bits() >> (usize::BITS - bits)) as usize)
+        .collect()
+}
+
+fn bit_reverse_permute(values: &mut [Fp], bitrev: &[usize]) {
+    for (i, &j) in bitrev.iter().enumerate() {
         if i < j {
             values.swap(i, j);
         }

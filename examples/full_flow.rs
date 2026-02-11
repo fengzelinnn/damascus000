@@ -23,7 +23,7 @@ fn main() -> Result<()> {
     let gpu_min_elements = env::var("DAMASCUS_GPU_MIN_ELEMS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16_777_216);
+        .unwrap_or(2_097_152);
     let runtime = RuntimeConfig {
         ntt_enabled,
         parallel_enabled: true,

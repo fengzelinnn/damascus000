@@ -13,9 +13,31 @@ __device__ __forceinline__ uint64_t add_fp(uint64_t a, uint64_t b) {
     return c;
 }
 
+__device__ __forceinline__ void mul_wide_u64_u64(uint64_t a,
+                                                 uint64_t b,
+                                                 uint64_t& lo,
+                                                 uint64_t& hi) {
+    // Split to 32-bit limbs. This is typically faster than native 64-bit
+    // multiply on consumer GPUs where int64 throughput is limited.
+    const uint64_t a0 = static_cast<uint32_t>(a);
+    const uint64_t a1 = a >> 32;
+    const uint64_t b0 = static_cast<uint32_t>(b);
+    const uint64_t b1 = b >> 32;
+
+    const uint64_t m0 = a0 * b0;
+    const uint64_t m1 = a0 * b1;
+    const uint64_t m2 = a1 * b0;
+    const uint64_t m3 = a1 * b1;
+
+    const uint64_t carry = (m0 >> 32) + (m1 & EPSILON) + (m2 & EPSILON);
+    lo = (m0 & EPSILON) | (carry << 32);
+    hi = m3 + (m1 >> 32) + (m2 >> 32) + (carry >> 32);
+}
+
 __device__ __forceinline__ uint64_t mul_fp(uint64_t a, uint64_t b) {
-    uint64_t lo = a * b;
-    uint64_t hi = __umul64hi(a, b);
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    mul_wide_u64_u64(a, b, lo, hi);
 
     uint64_t x_hi_hi = hi >> 32;
     uint64_t x_hi_lo = hi & EPSILON;
