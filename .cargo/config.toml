@@ -1,0 +1,5 @@
+[env]
+PATH = { value = "C:/Program Files/LLVM/bin;C:/Users/111111/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained;C:/Windows/System32;C:/Windows", force = true }
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-Cdlltool=llvm-dlltool.exe"]

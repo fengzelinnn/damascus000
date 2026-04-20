@@ -1,3 +1,15 @@
 /target
 sample.txt
 sample.txt
+bench-reports/protocol_metrics_stages.csv
+bench-reports/protocol_metrics_stages.md
+bench-reports/protocol_metrics_summary.csv
+bench-reports/protocol_metrics_summary.md
+bench-reports/bench-reports/protocol_metrics_stages.csv
+bench-reports/bench-reports/protocol_metrics_stages.md
+bench-reports/bench-reports/protocol_metrics_summary.csv
+bench-reports/bench-reports/protocol_metrics_summary.md
+src/bench-reports/protocol_metrics_stages.csv
+src/bench-reports/protocol_metrics_stages.md
+src/bench-reports/protocol_metrics_summary.csv
+src/bench-reports/protocol_metrics_summary.md

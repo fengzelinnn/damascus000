@@ -4,7 +4,8 @@ use damascus_core::{
     DamascusProver, DamascusVerifier, MicroBlock, ModuleCommitment, RuntimeConfig, SystemParams,
 };
 use std::env;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -183,6 +184,17 @@ fn run_single_scenario(
         ntt_mode,
         gpu_mode
     );
+    if derived.vector_len < derived.logical_square_len {
+        eprintln!(
+            "[bench] layout={}x{} rounds={} (logical_side={} before DAMASCUS_MAX_TENSOR_DIM cap)",
+            derived.vector_len, derived.poly_len, derived.rounds, derived.logical_square_len
+        );
+    } else {
+        eprintln!(
+            "[bench] layout={}x{} rounds={}",
+            derived.vector_len, derived.poly_len, derived.rounds
+        );
+    }
     eprintln!(
         "[bench] {} {} preprocess start",
         scenario_id,
@@ -370,7 +382,7 @@ fn run_single_scenario(
         gpu_mode,
         vector_len: params.vector_len,
         poly_len: params.poly_len,
-        rounds: params.rounds,
+        rounds: total_rounds,
         preprocess_ms: ms(preprocess_duration),
         preprocess_bytes: file_size_bytes,
         preprocess_mib_s: throughput_mib_per_s(file_size_bytes, preprocess_duration),
@@ -423,10 +435,9 @@ fn collect_input_files() -> Result<Vec<PathBuf>> {
         }
     }
 
-    ensure!(
-        !paths.is_empty(),
-        "set DAMASCUS_BENCH_FILES (use ';', ',' or newline separators), or DAMASCUS_BENCH_FILE_LIST"
-    );
+    if paths.is_empty() {
+        paths = ensure_default_input_files()?;
+    }
 
     let mut resolved = Vec::new();
     for path in paths {
@@ -440,6 +451,105 @@ fn collect_input_files() -> Result<Vec<PathBuf>> {
         resolved.push(path);
     }
     Ok(resolved)
+}
+
+fn ensure_default_input_files() -> Result<Vec<PathBuf>> {
+    let report_dir = Path::new("target/bench-inputs");
+    if !report_dir.exists() {
+        fs::create_dir_all(report_dir).context("create default bench input directory")?;
+    }
+
+    let sizes = env::var("DAMASCUS_BENCH_CASE_SIZES")
+        .ok()
+        .map(|raw| parse_bench_sizes(&raw))
+        .transpose()?
+        .filter(|sizes| !sizes.is_empty())
+        .unwrap_or_else(default_bench_case_sizes);
+
+    let mut paths = Vec::with_capacity(sizes.len());
+    for size in sizes {
+        let label = human_size_compact(size);
+        let path = report_dir.join(format!("bench_{}.bin", label));
+        ensure_bench_input_file(&path, size)?;
+        paths.push(path);
+    }
+
+    eprintln!(
+        "[bench] DAMASCUS_BENCH_FILES not set, generated {} default input file(s) in {}",
+        paths.len(),
+        report_dir.display()
+    );
+    Ok(paths)
+}
+
+fn default_bench_case_sizes() -> Vec<u64> {
+    vec![1 << 20, 8 << 20, 16 << 20, 32 << 20, 64 << 20]
+}
+
+fn parse_bench_sizes(raw: &str) -> Result<Vec<u64>> {
+    raw.split(|c| c == ';' || c == ',' || c == '\n' || c == '\r')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_size_spec)
+        .collect()
+}
+
+fn parse_size_spec(raw: &str) -> Result<u64> {
+    let normalized = raw.trim().to_ascii_lowercase().replace('_', "");
+    let (number_part, multiplier) = if let Some(v) = normalized.strip_suffix("gib") {
+        (v, 1u64 << 30)
+    } else if let Some(v) = normalized.strip_suffix("gb") {
+        (v, 1_000_000_000u64)
+    } else if let Some(v) = normalized.strip_suffix("mib") {
+        (v, 1u64 << 20)
+    } else if let Some(v) = normalized.strip_suffix("mb") {
+        (v, 1_000_000u64)
+    } else if let Some(v) = normalized.strip_suffix("kib") {
+        (v, 1u64 << 10)
+    } else if let Some(v) = normalized.strip_suffix("kb") {
+        (v, 1_000u64)
+    } else if let Some(v) = normalized.strip_suffix('b') {
+        (v, 1u64)
+    } else {
+        (normalized.as_str(), 1u64)
+    };
+
+    let value = number_part
+        .parse::<u64>()
+        .with_context(|| format!("invalid benchmark size: {raw}"))?;
+    let bytes = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("benchmark size overflow: {raw}"))?;
+    ensure!(bytes > 0, "benchmark size must be > 0: {raw}");
+    Ok(bytes)
+}
+
+fn ensure_bench_input_file(path: &Path, size_bytes: u64) -> Result<()> {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.is_file() && meta.len() == size_bytes {
+            return Ok(());
+        }
+    }
+
+    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut chunk = vec![0u8; 1024 * 1024];
+    for (idx, byte) in chunk.iter_mut().enumerate() {
+        *byte = (idx % 251) as u8;
+    }
+
+    let mut remaining = size_bytes;
+    while remaining > 0 {
+        let to_write = remaining.min(chunk.len() as u64) as usize;
+        writer
+            .write_all(&chunk[..to_write])
+            .with_context(|| format!("write {}", path.display()))?;
+        remaining -= to_write as u64;
+    }
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", path.display()))?;
+    Ok(())
 }
 
 fn parse_path_list(raw: &str) -> Vec<PathBuf> {
@@ -520,17 +630,21 @@ fn write_reports(summary_rows: &[SummaryRow], stage_rows: &[StageRow]) -> Result
         .with_context(|| format!("write {}", summary_csv_path.display()))?;
 
     let mut summary_md = String::from(
-        "| Scenario | File | Size | NTT | GPU | Rounds | Preprocess (ms) | Fold Total (ms) | Verify Total (ms) | End-to-End (ms) | Overall Throughput (MiB/s) |\n",
+        "| Scenario | File | Size | NTT | GPU | Vector Len | Poly Len | Rounds | Preprocess (ms) | Fold Total (ms) | Verify Total (ms) | End-to-End (ms) | Overall Throughput (MiB/s) |\n",
     );
-    summary_md.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    summary_md.push_str(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n",
+    );
     for row in summary_rows {
         summary_md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |\n",
             row.scenario_id,
             row.file_path,
             human_size(row.file_size_bytes),
             row.ntt_mode,
             row.gpu_mode,
+            row.vector_len,
+            row.poly_len,
             row.rounds,
             row.preprocess_ms,
             row.fold_total_ms,
@@ -725,6 +839,22 @@ fn human_size(bytes: u64) -> String {
     format!("{value:.2} {}", UNITS[unit_idx])
 }
 
+fn human_size_compact(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const KIB: u64 = 1 << 10;
+
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
+        format!("{}gib", bytes / GIB)
+    } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{}mib", bytes / MIB)
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{}kib", bytes / KIB)
+    } else {
+        format!("{bytes}b")
+    }
+}
+
 fn progress_bar(done: usize, total: usize, width: usize) -> String {
     let safe_total = total.max(1);
     let clamped_done = done.min(safe_total);
@@ -751,35 +881,64 @@ struct DerivedLayout {
     vector_len: usize,
     poly_len: usize,
     rounds: usize,
+    logical_square_len: usize,
 }
 
 fn derive_layout(input_size_bytes: u64) -> DerivedLayout {
     let words =
         usize::try_from((input_size_bytes.saturating_add(7) / 8).max(1)).unwrap_or(usize::MAX);
 
-    let configured_poly = env::var("DAMASCUS_POLY_LEN")
+    // The protocol currently requires a square tensor, so the natural side length is the
+    // smallest power of two whose square can hold the entire file without wrapping.
+    let required_square_len = pad_pow2(ceil_sqrt(words).max(2));
+    let configured_min_square_len = env::var("DAMASCUS_POLY_LEN")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(1024);
-    let padded_poly_len = pad_pow2(configured_poly.max(2));
-    let raw_vector_len = words.div_ceil(padded_poly_len).max(2);
-    let padded_vector_len = pad_pow2(raw_vector_len);
+        .map(|v| pad_pow2(v.max(2)))
+        .unwrap_or(2);
+    let logical_square_len = required_square_len.max(configured_min_square_len);
     let configured_max_vector = env::var("DAMASCUS_MAX_TENSOR_DIM")
         .ok()
         .or_else(|| env::var("DAMASCUS_MAX_VECTOR_LEN").ok())
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v >= 2)
-        .unwrap_or(16_384);
-    let max_vector_len = floor_pow2(configured_max_vector).max(2);
-    let square_len = padded_vector_len.max(padded_poly_len).min(max_vector_len);
+        .map(|v| floor_pow2(v).max(2));
+    let square_len = configured_max_vector
+        .map(|max_vector_len| logical_square_len.min(max_vector_len))
+        .unwrap_or(logical_square_len);
     let rounds = floor_log2(square_len);
 
     DerivedLayout {
         vector_len: square_len,
         poly_len: square_len,
         rounds,
+        logical_square_len,
     }
+}
+
+fn ceil_sqrt(value: usize) -> usize {
+    if value <= 1 {
+        return value;
+    }
+
+    let target = value as u128;
+    let mut low = 1usize;
+    let mut high = 1usize;
+    while (high as u128).saturating_mul(high as u128) < target {
+        high = high.saturating_mul(2);
+    }
+
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if (mid as u128).saturating_mul(mid as u128) < target {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    low
 }
 
 fn params_from_layout(layout: &DerivedLayout) -> SystemParams {

@@ -66,6 +66,20 @@ impl Poly {
         (Self::new(even), Self::new(odd))
     }
 
+    pub fn into_odd_even_decomposition(self) -> (Self, Self) {
+        let len = self.coeffs.len();
+        let mut even = Vec::with_capacity(len.div_ceil(2));
+        let mut odd = Vec::with_capacity(len / 2);
+        for (idx, coeff) in self.coeffs.into_iter().enumerate() {
+            if idx % 2 == 0 {
+                even.push(coeff);
+            } else {
+                odd.push(coeff);
+            }
+        }
+        (Self::new(even), Self::new(odd))
+    }
+
     pub fn fold_odd_even(&self, challenge: Fp) -> Self {
         let (even, odd) = self.odd_even_decomposition();
         let mut coeffs = even.coeffs;
@@ -133,6 +147,14 @@ mod tests {
 
         let folded = p.fold_odd_even(Fp::from(2));
         assert_eq!(folded.coeffs[0], Fp::from(5));
+    }
+
+    #[test]
+    fn consuming_odd_even_split_matches_borrowed_version() {
+        let p = Poly::new((1u64..=8).map(Fp::from).collect());
+        let expected = p.odd_even_decomposition();
+        let actual = p.into_odd_even_decomposition();
+        assert_eq!(actual, expected);
     }
 
     #[test]

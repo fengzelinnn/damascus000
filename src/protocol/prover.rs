@@ -133,23 +133,25 @@ impl DamascusProver {
         );
 
         let total_start = Instant::now();
+        let mut message = std::mem::take(&mut self.witness.message);
+        let mut blinding = std::mem::take(&mut self.witness.blinding);
 
         let vector_start = Instant::now();
-        let mid = self.witness.message.len() / 2;
-        let msg_left = &self.witness.message[..mid];
-        let msg_right = &self.witness.message[mid..];
-        let rnd_left = &self.witness.blinding[..mid];
-        let rnd_right = &self.witness.blinding[mid..];
+        let mid = message.len() / 2;
+        let msg_right = message.split_off(mid);
+        let msg_left = message;
+        let rnd_right = blinding.split_off(mid);
+        let rnd_left = blinding;
 
         let left_vector_commitment = self
-            .commit_polys(msg_left, rnd_left)
+            .commit_polys(&msg_left, &rnd_left)
             .context("left vector commitment failed")?;
         let right_vector_commitment = self
-            .commit_polys(msg_right, rnd_right)
+            .commit_polys(&msg_right, &rnd_right)
             .context("right vector commitment failed")?;
 
         let vector_cross_term =
-            self.compute_vector_cross_term(msg_left, msg_right, rnd_left, rnd_right)?;
+            self.compute_vector_cross_term(&msg_left, &msg_right, &rnd_left, &rnd_right)?;
 
         self.transcript.absorb_stage1_header(
             round_idx,
@@ -183,9 +185,9 @@ impl DamascusProver {
 
         let poly_start = Instant::now();
         let (msg_even, msg_odd) =
-            split_even_odd_vector(&folded_message, self.config.parallel_enabled);
+            split_even_odd_vector(folded_message, self.config.parallel_enabled);
         let (rnd_even, rnd_odd) =
-            split_even_odd_vector(&folded_blinding, self.config.parallel_enabled);
+            split_even_odd_vector(folded_blinding, self.config.parallel_enabled);
 
         ensure!(!msg_even.is_empty(), "even polynomial vector is empty");
         ensure!(
@@ -330,8 +332,8 @@ impl DamascusProver {
 }
 
 fn fold_poly_vectors(
-    left: &[Poly],
-    right: &[Poly],
+    left: Vec<Poly>,
+    right: Vec<Poly>,
     challenge: Fp,
     parallel_enabled: bool,
     gpu_enabled: bool,
@@ -354,12 +356,10 @@ fn fold_poly_vectors(
     let use_gpu = gpu_enabled && total_elements >= gpu_min_elements;
 
     if use_gpu {
-        let left_flat = flatten_polys_u64(left, poly_len, parallel_enabled);
-        let right_flat = flatten_polys_u64(right, poly_len, parallel_enabled);
-
-        if let Some(out_flat) = gpu::try_fold_pairs_gpu(&left_flat, &right_flat, challenge.as_u64())
+        if let Some(folded) =
+            fold_poly_vectors_gpu_batched(&left, &right, poly_len, challenge, parallel_enabled)
         {
-            return Ok(unflatten_polys_u64(&out_flat, left.len(), poly_len));
+            return Ok(folded);
         }
     }
 
@@ -367,40 +367,54 @@ fn fold_poly_vectors(
 }
 
 fn fold_poly_vectors_cpu(
-    left: &[Poly],
-    right: &[Poly],
+    left: Vec<Poly>,
+    right: Vec<Poly>,
     challenge: Fp,
     parallel_enabled: bool,
 ) -> Result<Vec<Poly>> {
     if parallel_enabled {
-        left.par_iter()
-            .zip(right.par_iter())
-            .map(|(l, r)| {
+        left.into_par_iter()
+            .zip(right.into_par_iter())
+            .map(|(mut l, r)| {
                 ensure!(l.len() == r.len(), "polynomial length mismatch");
-                let coeffs = l
-                    .coeffs
-                    .iter()
-                    .zip(&r.coeffs)
-                    .map(|(a, b)| *a + (*b * challenge))
-                    .collect();
-                Ok(Poly::new(coeffs))
+                for (dst, src) in l.coeffs.iter_mut().zip(r.coeffs.into_iter()) {
+                    *dst += src * challenge;
+                }
+                Ok(l)
             })
             .collect()
     } else {
-        left.iter()
+        left.into_iter()
             .zip(right)
-            .map(|(l, r)| {
+            .map(|(mut l, r)| {
                 ensure!(l.len() == r.len(), "polynomial length mismatch");
-                let coeffs = l
-                    .coeffs
-                    .iter()
-                    .zip(&r.coeffs)
-                    .map(|(a, b)| *a + (*b * challenge))
-                    .collect();
-                Ok(Poly::new(coeffs))
+                for (dst, src) in l.coeffs.iter_mut().zip(r.coeffs.into_iter()) {
+                    *dst += src * challenge;
+                }
+                Ok(l)
             })
             .collect()
     }
+}
+
+fn fold_poly_vectors_gpu_batched(
+    left: &[Poly],
+    right: &[Poly],
+    poly_len: usize,
+    challenge: Fp,
+    parallel_enabled: bool,
+) -> Option<Vec<Poly>> {
+    let batch_rows = resolve_gpu_fold_batch_rows(poly_len, left.len());
+    let mut out = Vec::with_capacity(left.len());
+
+    for (left_chunk, right_chunk) in left.chunks(batch_rows).zip(right.chunks(batch_rows)) {
+        let left_flat = flatten_polys_u64(left_chunk, poly_len, parallel_enabled);
+        let right_flat = flatten_polys_u64(right_chunk, poly_len, parallel_enabled);
+        let out_flat = gpu::try_fold_pairs_gpu(&left_flat, &right_flat, challenge.as_u64())?;
+        out.extend(unflatten_polys_u64(&out_flat, left_chunk.len(), poly_len));
+    }
+
+    Some(out)
 }
 
 fn flatten_polys_u64(polys: &[Poly], poly_len: usize, parallel_enabled: bool) -> Vec<u64> {
@@ -430,14 +444,29 @@ fn unflatten_polys_u64(flat: &[u64], rows: usize, poly_len: usize) -> Vec<Poly> 
         .collect()
 }
 
-fn split_even_odd_vector(polys: &[Poly], parallel_enabled: bool) -> (Vec<Poly>, Vec<Poly>) {
+fn resolve_gpu_fold_batch_rows(poly_len: usize, total_rows: usize) -> usize {
+    const DEFAULT_GPU_FOLD_BATCH_BYTES: usize = 256 * 1024 * 1024;
+    let batch_bytes = env::var("DAMASCUS_GPU_FOLD_BATCH_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= std::mem::size_of::<u64>())
+        .unwrap_or(DEFAULT_GPU_FOLD_BATCH_BYTES);
+    let row_bytes = poly_len.saturating_mul(std::mem::size_of::<u64>()).max(1);
+    let rows = (batch_bytes / row_bytes).max(1);
+    rows.min(total_rows.max(1))
+}
+
+fn split_even_odd_vector(polys: Vec<Poly>, parallel_enabled: bool) -> (Vec<Poly>, Vec<Poly>) {
     if parallel_enabled {
-        polys.par_iter().map(Poly::odd_even_decomposition).unzip()
+        polys
+            .into_par_iter()
+            .map(Poly::into_odd_even_decomposition)
+            .unzip()
     } else {
         let mut even = Vec::with_capacity(polys.len());
         let mut odd = Vec::with_capacity(polys.len());
         for poly in polys {
-            let (e, o) = poly.odd_even_decomposition();
+            let (e, o) = poly.into_odd_even_decomposition();
             even.push(e);
             odd.push(o);
         }
@@ -455,8 +484,8 @@ fn fold_even_odd_pairs(
 ) -> Result<Vec<Poly>> {
     ensure!(even.len() == odd.len(), "even/odd vector length mismatch");
     fold_poly_vectors(
-        &even,
-        &odd,
+        even,
+        odd,
         beta,
         parallel_enabled,
         gpu_enabled,
