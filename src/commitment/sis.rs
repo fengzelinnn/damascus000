@@ -186,6 +186,18 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
     }
 }
 
+pub fn derive_generator_families_from_seeds<const K: usize>(
+    g_seed: [u8; 32],
+    h_seed: [u8; 32],
+    vector_len: usize,
+    ring_len: usize,
+) -> Result<GeneratorFamilies<K>> {
+    Ok(GeneratorFamilies {
+        g: derive_generators(g_seed, b"g", vector_len, ring_len)?,
+        h: derive_generators(h_seed, b"h", vector_len, ring_len)?,
+    })
+}
+
 fn derive_subseed(seed: [u8; 32], label: &[u8]) -> [u8; 32] {
     *blake3::keyed_hash(&seed, label).as_bytes()
 }

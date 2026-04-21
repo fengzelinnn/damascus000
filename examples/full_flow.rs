@@ -52,7 +52,8 @@ fn main() -> Result<()> {
     let preprocess_start = Instant::now();
     let mut prover = DamascusProver::initialize_with_config(&file_path, params.clone(), runtime)?;
     let preprocess_time = preprocess_start.elapsed();
-    let mut verifier = DamascusVerifier::new(params, prover.current_commitment().clone());
+    let mut verifier =
+        DamascusVerifier::new(params, prover.statement().clone()).context("new verifier")?;
 
     println!(
         "preprocess: {:.3}ms",
@@ -100,6 +101,11 @@ fn main() -> Result<()> {
 
     if prover.current_commitment() != verifier.current_commitment() {
         anyhow::bail!("final commitment mismatch between prover and verifier");
+    }
+    if let Some(opening) = prover.final_opening() {
+        verifier
+            .verify_final_opening(&opening)
+            .context("verify final opening")?;
     }
 
     println!(

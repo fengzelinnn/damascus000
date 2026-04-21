@@ -1,7 +1,7 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use damascus_core::{
-    DamascusProver, DamascusVerifier, MicroBlock, ModuleCommitment, RuntimeConfig, SystemParams,
+    DamascusProver, DamascusStatement, DamascusVerifier, MicroBlock, RuntimeConfig, SystemParams,
 };
 use std::env;
 use std::fs::{self, File};
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 struct VerifyScenario {
     id: String,
     params: SystemParams,
-    initial_commitment: ModuleCommitment,
+    statement: DamascusStatement,
     micro_blocks: Vec<MicroBlock>,
 }
 
@@ -76,13 +76,13 @@ fn protocol_benchmark(c: &mut Criterion) {
     for scenario in run.verify_scenarios {
         let id = scenario.id.clone();
         let params = scenario.params.clone();
-        let initial_commitment = scenario.initial_commitment.clone();
+        let statement = scenario.statement.clone();
         let micro_blocks = scenario.micro_blocks.clone();
 
         group.bench_function(BenchmarkId::new("verify_all_rounds", id), |b| {
             b.iter(|| {
                 let mut verifier =
-                    DamascusVerifier::new(params.clone(), initial_commitment.clone());
+                    DamascusVerifier::new(params.clone(), statement.clone()).expect("verifier");
                 for block in &micro_blocks {
                     verifier
                         .update_commitment(black_box(block))
@@ -214,8 +214,8 @@ fn run_single_scenario(
         throughput_mib_per_s(file_size_bytes, preprocess_duration)
     );
 
-    let initial_commitment = prover.current_commitment().clone();
-    let mut verifier = DamascusVerifier::new(params.clone(), initial_commitment.clone());
+    let statement = prover.statement().clone();
+    let mut verifier = DamascusVerifier::new(params.clone(), statement.clone())?;
     let total_rounds = prover.rounds_total();
 
     let mut rows = Vec::new();
@@ -410,7 +410,7 @@ fn run_single_scenario(
         verify_scenario: VerifyScenario {
             id: scenario_id,
             params,
-            initial_commitment,
+            statement,
             micro_blocks,
         },
         summary_row: summary,

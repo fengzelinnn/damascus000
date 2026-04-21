@@ -1,68 +1,84 @@
-﻿use crate::algebra::field::Fp;
-use crate::commitment::hasher::RandomOracle;
+use crate::algebra::field::Fp;
+use crate::commitment::sis::DamascusStatement;
 use crate::commitment::sis::ModuleCommitment;
 use crate::utils::config::SystemParams;
 
 #[derive(Clone, Debug)]
 pub struct Transcript {
-    oracle: RandomOracle,
+    epoch_seed: [u8; 32],
+    file_id: [u8; 32],
+    epoch_index: u64,
 }
 
 impl Transcript {
-    pub fn new(params: &SystemParams, initial_commitment: &ModuleCommitment) -> Self {
-        let mut oracle = RandomOracle::new("damascus-conv-transcript-v1");
-        oracle.absorb_usize(params.module_rank);
-        oracle.absorb_usize(params.vector_len);
-        oracle.absorb_usize(params.poly_len);
-        oracle.absorb_usize(params.rounds);
-        oracle.absorb_bytes(&params.seed_generators);
-        oracle.absorb_commitment(initial_commitment);
-        Self { oracle }
+    pub fn new(params: &SystemParams, statement: &DamascusStatement) -> Self {
+        Self {
+            epoch_seed: params.epoch_seed,
+            file_id: statement.file_id,
+            epoch_index: 0,
+        }
     }
 
-    pub fn absorb_stage1_header(
-        &mut self,
+    pub fn challenge_vec(
+        &self,
         round: usize,
         current_commitment: &ModuleCommitment,
-        left_commitment: &ModuleCommitment,
-        right_commitment: &ModuleCommitment,
-    ) {
-        self.oracle.absorb_u64(0x5354_4745_315F_4844);
-        self.oracle.absorb_usize(round);
-        self.oracle.absorb_commitment(current_commitment);
-        self.oracle.absorb_commitment(left_commitment);
-        self.oracle.absorb_commitment(right_commitment);
+        l_vec: &ModuleCommitment,
+        r_vec: &ModuleCommitment,
+    ) -> Fp {
+        self.challenge(b"vec", round, current_commitment, l_vec, r_vec)
     }
 
-    pub fn absorb_stage1_result(&mut self, alpha: Fp, folded_commitment: &ModuleCommitment) {
-        self.oracle.absorb_u64(0x5354_4745_315F_5253);
-        self.oracle.absorb_field(alpha);
-        self.oracle.absorb_commitment(folded_commitment);
+    pub fn challenge_poly(
+        &self,
+        round: usize,
+        folded_commitment: &ModuleCommitment,
+        l_poly: &ModuleCommitment,
+        r_poly: &ModuleCommitment,
+    ) -> Fp {
+        self.challenge(b"poly", round, folded_commitment, l_poly, r_poly)
     }
 
-    pub fn absorb_stage2_header(
-        &mut self,
-        vector_fold_commitment: &ModuleCommitment,
-        even_commitment: &ModuleCommitment,
-        odd_commitment: &ModuleCommitment,
-    ) {
-        self.oracle.absorb_u64(0x5354_4745_325F_4844);
-        self.oracle.absorb_commitment(vector_fold_commitment);
-        self.oracle.absorb_commitment(even_commitment);
-        self.oracle.absorb_commitment(odd_commitment);
+    fn challenge(
+        &self,
+        label: &[u8],
+        round: usize,
+        current_commitment: &ModuleCommitment,
+        lhs: &ModuleCommitment,
+        rhs: &ModuleCommitment,
+    ) -> Fp {
+        let mut counter = 0u32;
+        loop {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&self.epoch_seed);
+            absorb_bytes(&mut hasher, label);
+            absorb_bytes(&mut hasher, &self.file_id);
+            hasher.update(&self.epoch_index.to_le_bytes());
+            hasher.update(&(round as u64).to_le_bytes());
+            absorb_commitment(&mut hasher, current_commitment);
+            absorb_commitment(&mut hasher, lhs);
+            absorb_commitment(&mut hasher, rhs);
+            hasher.update(&counter.to_le_bytes());
+            let challenge = Fp::from_le_bytes_mod_order(hasher.finalize().as_bytes());
+            if !challenge.is_zero() {
+                return challenge;
+            }
+            counter = counter.wrapping_add(1);
+        }
     }
+}
 
-    pub fn absorb_stage2_result(&mut self, beta: Fp, next_commitment: &ModuleCommitment) {
-        self.oracle.absorb_u64(0x5354_4745_325F_5253);
-        self.oracle.absorb_field(beta);
-        self.oracle.absorb_commitment(next_commitment);
-    }
+fn absorb_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
 
-    pub fn challenge_alpha(&self) -> Fp {
-        self.oracle.challenge_field("alpha")
-    }
-
-    pub fn challenge_beta(&self) -> Fp {
-        self.oracle.challenge_field("beta")
+fn absorb_commitment(hasher: &mut blake3::Hasher, commitment: &ModuleCommitment) {
+    hasher.update(&(commitment.coords.len() as u64).to_le_bytes());
+    for coord in &commitment.coords {
+        hasher.update(&(coord.coeffs.len() as u64).to_le_bytes());
+        for coeff in &coord.coeffs {
+            hasher.update(&coeff.to_le_bytes());
+        }
     }
 }

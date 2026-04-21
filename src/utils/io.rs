@@ -34,13 +34,10 @@ pub fn expand_file_to_square_polys(
     max_preprocess_bytes: usize,
 ) -> Result<ExpandedFile> {
     let file_id = *blake3::hash(mmap).as_bytes();
-    let coeff_count = mmap.len().div_ceil(BYTES_PER_COEFF).max(1);
+    let coeff_count = coeff_count_for_byte_len(mmap.len() as u64);
     let ring_len = POLY_DEGREE;
-    let vector_len = coeff_count
-        .div_ceil(ring_len)
-        .max(1)
-        .checked_next_power_of_two()
-        .context("vector witness dimension overflow")?;
+    let vector_len =
+        vector_len_for_coeff_count(coeff_count).context("vector witness dimension overflow")?;
     let required_coeff_capacity = vector_len
         .checked_mul(ring_len)
         .context("witness capacity overflow")?;
@@ -69,9 +66,26 @@ pub fn expand_file_to_square_polys(
         coeff_count,
         vector_len,
         ring_len,
-        depth: floor_log2(vector_len.min(ring_len)),
+        depth: floor_log2(vector_len.max(ring_len)),
         message,
     })
+}
+
+pub fn coeff_count_for_byte_len(byte_len: u64) -> usize {
+    usize::try_from(byte_len.div_ceil(BYTES_PER_COEFF as u64))
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+pub fn vector_len_for_coeff_count(coeff_count: usize) -> Option<usize> {
+    coeff_count
+        .div_ceil(POLY_DEGREE)
+        .max(1)
+        .checked_next_power_of_two()
+}
+
+pub fn vector_len_for_file_size(byte_len: u64) -> Option<usize> {
+    vector_len_for_coeff_count(coeff_count_for_byte_len(byte_len))
 }
 
 pub fn sample_blinding_polys(
