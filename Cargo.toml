@@ -2,7 +2,7 @@
 name = "damascus-core"
 version = "0.1.0"
 edition = "2021"
-description = "Damascus-conv protocol prototype in Rust"
+description = "Damascus Fold protocol prototype in Rust"
 license = "MIT"
 
 [dependencies]

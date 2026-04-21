@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
 use damascus_core::utils::gpu;
+use damascus_core::utils::{
+    config::{MODULE_RANK, POLY_DEGREE},
+    io::{coeff_count_for_byte_len, vector_len_for_file_size},
+};
 use damascus_core::{DamascusProver, DamascusVerifier, RuntimeConfig, SystemParams};
 use std::env;
 use std::fs;
@@ -39,15 +43,9 @@ fn main() -> Result<()> {
         human_size(input_size_bytes)
     );
     println!(
-        "derived params: vector_len={} (raw={}), poly_len={} (raw={})",
-        derived.vector_len, derived.raw_vector_len, derived.poly_len, derived.raw_poly_len
+        "derived params: coeff_count={} vector_len={} poly_len={} rounds={} module_rank={}",
+        derived.coeff_count, derived.vector_len, derived.poly_len, derived.rounds, MODULE_RANK
     );
-    if derived.capped_by_max_vector {
-        println!(
-            "note: tensor dimension capped at {} (set DAMASCUS_MAX_TENSOR_DIM to adjust; DAMASCUS_MAX_VECTOR_LEN is still supported)",
-            derived.max_vector_len
-        );
-    }
 
     let preprocess_start = Instant::now();
     let mut prover = DamascusProver::initialize_with_config(&file_path, params.clone(), runtime)?;
@@ -133,67 +131,32 @@ fn create_default_input_file() -> Result<PathBuf> {
 
 #[derive(Clone, Copy, Debug)]
 struct DerivedLayout {
-    raw_vector_len: usize,
-    raw_poly_len: usize,
+    coeff_count: usize,
     vector_len: usize,
     poly_len: usize,
     rounds: usize,
-    capped_by_max_vector: bool,
-    max_vector_len: usize,
 }
 
 fn derive_layout(input_size_bytes: u64) -> DerivedLayout {
-    // Streamed mapping ingests 8-byte words into a vector of polynomials.
-    let words =
-        usize::try_from((input_size_bytes.saturating_add(7) / 8).max(1)).unwrap_or(usize::MAX);
-
-    // Poly length can be configured; we always pad to power-of-two.
-    let configured_poly = env::var("DAMASCUS_POLY_LEN")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(1024);
-    let raw_poly_len = configured_poly;
-    let padded_poly_len = pad_pow2(raw_poly_len.max(2));
-
-    // Vector count grows with file size, then gets padded to power-of-two.
-    let raw_vector_len = words.div_ceil(padded_poly_len).max(2);
-    let padded_vector_len = pad_pow2(raw_vector_len);
-    let configured_max_vector = env::var("DAMASCUS_MAX_TENSOR_DIM")
-        .ok()
-        .or_else(|| env::var("DAMASCUS_MAX_VECTOR_LEN").ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= 2)
-        .unwrap_or(16_384);
-    let max_vector_len = floor_pow2(configured_max_vector).max(2);
-    // Preprocessing uses a logical square tensor:
-    // both dimensions are padded to power-of-two and then unified.
-    let padded_square_len = padded_vector_len.max(padded_poly_len);
-    let capped_by_max_vector = padded_square_len > max_vector_len;
-    let square_len = padded_square_len.min(max_vector_len);
-    let vector_len = square_len;
-    let poly_len = square_len;
-    let rounds = floor_log2(square_len);
+    let coeff_count = coeff_count_for_byte_len(input_size_bytes);
+    let vector_len = vector_len_for_file_size(input_size_bytes).unwrap_or(1);
+    let poly_len = POLY_DEGREE;
+    let rounds = floor_log2(vector_len.max(poly_len));
 
     DerivedLayout {
-        raw_vector_len,
-        raw_poly_len,
+        coeff_count,
         vector_len,
         poly_len,
         rounds,
-        capped_by_max_vector,
-        max_vector_len,
     }
 }
 
 fn params_from_layout(layout: &DerivedLayout) -> SystemParams {
-    let rounds = layout.rounds;
-
     SystemParams {
-        module_rank: 4,
+        module_rank: MODULE_RANK,
         vector_len: layout.vector_len,
         poly_len: layout.poly_len,
-        rounds,
+        rounds: layout.rounds,
         seed_generators: [11u8; 32],
         epoch_seed: [13u8; 32],
     }
@@ -215,23 +178,5 @@ fn floor_log2(x: usize) -> usize {
         0
     } else {
         (usize::BITS as usize - 1) - (x.leading_zeros() as usize)
-    }
-}
-
-fn pad_pow2(value: usize) -> usize {
-    if value <= 1 {
-        1
-    } else {
-        value
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX / 2 + 1)
-    }
-}
-
-fn floor_pow2(value: usize) -> usize {
-    if value <= 1 {
-        1
-    } else {
-        1usize << floor_log2(value)
     }
 }

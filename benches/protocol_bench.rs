@@ -1,5 +1,9 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use damascus_core::utils::{
+    config::{MODULE_RANK, POLY_DEGREE},
+    io::{coeff_count_for_byte_len, vector_len_for_file_size},
+};
 use damascus_core::{
     DamascusProver, DamascusStatement, DamascusVerifier, MicroBlock, RuntimeConfig, SystemParams,
 };
@@ -185,17 +189,10 @@ fn run_single_scenario(
         ntt_mode,
         gpu_mode
     );
-    if derived.vector_len < derived.logical_square_len {
-        eprintln!(
-            "[bench] layout={}x{} rounds={} (logical_side={} before DAMASCUS_MAX_TENSOR_DIM cap)",
-            derived.vector_len, derived.poly_len, derived.rounds, derived.logical_square_len
-        );
-    } else {
-        eprintln!(
-            "[bench] layout={}x{} rounds={}",
-            derived.vector_len, derived.poly_len, derived.rounds
-        );
-    }
+    eprintln!(
+        "[bench] coeff_count={} layout={}x{} rounds={}",
+        derived.coeff_count, derived.vector_len, derived.poly_len, derived.rounds
+    );
     eprintln!(
         "[bench] {} {} preprocess start",
         scenario_id,
@@ -240,7 +237,6 @@ fn run_single_scenario(
     let mut fold_total_bytes = 0u64;
     let mut verify_total_duration = Duration::ZERO;
     let mut verify_payload_bytes = 0u64;
-    let scenario_cross_term_domain = resolve_cross_term_domain_for_bench(params.poly_len);
     let mut completed_round_steps = 0usize;
     let total_round_steps = total_rounds * 2;
 
@@ -266,18 +262,8 @@ fn run_single_scenario(
         let verify_duration = verify_start.elapsed();
         completed_round_steps += 1;
 
-        let vector_stage_bytes = vector_stage_processed_bytes(
-            round_vector_len,
-            round_poly_len,
-            scenario_cross_term_domain,
-            ntt_enabled,
-        )?;
-        let poly_stage_bytes = poly_stage_processed_bytes(
-            round_vector_len,
-            round_poly_len,
-            scenario_cross_term_domain,
-            ntt_enabled,
-        )?;
+        let vector_stage_bytes = vector_stage_processed_bytes(round_vector_len, round_poly_len)?;
+        let poly_stage_bytes = poly_stage_processed_bytes(round_vector_len, round_poly_len)?;
         let fold_round_bytes = vector_stage_bytes.saturating_add(poly_stage_bytes);
         let payload_bytes = bincode::serialize(&round_output.micro_block)
             .context("serialize micro-block")?
@@ -362,14 +348,19 @@ fn run_single_scenario(
         verify_payload_bytes = verify_payload_bytes.saturating_add(payload_bytes);
 
         micro_blocks.push(round_output.micro_block);
-        round_vector_len /= 2;
-        round_poly_len /= 2;
+        round_vector_len = (round_vector_len / 2).max(1);
+        round_poly_len = (round_poly_len / 2).max(1);
     }
 
     ensure!(
         prover.current_commitment() == verifier.current_commitment(),
         "final commitment mismatch between prover and verifier"
     );
+    if let Some(opening) = prover.final_opening() {
+        verifier
+            .verify_final_opening(&opening)
+            .context("verify final opening")?;
+    }
 
     let end_to_end_duration = preprocess_duration + fold_total_duration + verify_total_duration;
     let total_measured_bytes = file_size_bytes
@@ -484,7 +475,7 @@ fn ensure_default_input_files() -> Result<Vec<PathBuf>> {
 }
 
 fn default_bench_case_sizes() -> Vec<u64> {
-    vec![1 << 20, 8 << 20, 16 << 20, 32 << 20, 64 << 20]
+    vec![128 << 10, 256 << 10, 512 << 10, 1 << 20]
 }
 
 fn parse_bench_sizes(raw: &str) -> Result<Vec<u64>> {
@@ -713,83 +704,42 @@ fn logical_tensor_bytes(vector_len: usize, poly_len: usize) -> Result<u64> {
     let elements = (vector_len as u128)
         .checked_mul(poly_len as u128)
         .ok_or_else(|| anyhow!("tensor size overflow: {} x {}", vector_len, poly_len))?;
-    let bytes = elements.checked_mul(8).ok_or_else(|| {
-        anyhow!(
-            "byte size overflow for tensor {} x {}",
-            vector_len,
-            poly_len
-        )
-    })?;
+    let bytes = elements
+        .checked_mul(damascus_core::algebra::field::Fp::SERDE_BYTES as u128)
+        .ok_or_else(|| {
+            anyhow!(
+                "byte size overflow for tensor {} x {}",
+                vector_len,
+                poly_len
+            )
+        })?;
     u64::try_from(bytes).map_err(|_| anyhow!("tensor bytes exceed u64"))
 }
 
-fn vector_stage_processed_bytes(
-    vector_len: usize,
-    poly_len: usize,
-    cross_term_domain: usize,
-    ntt_enabled: bool,
-) -> Result<u64> {
-    // Vector fold handles both witness tracks (message + blinding).
+fn module_payload_bytes(ring_len: usize) -> Result<u64> {
+    let elements = (MODULE_RANK as u128)
+        .checked_mul(ring_len as u128)
+        .ok_or_else(|| anyhow!("module payload overflow"))?;
+    let bytes = elements
+        .checked_mul(damascus_core::algebra::field::Fp::SERDE_BYTES as u128)
+        .ok_or_else(|| anyhow!("module payload byte overflow"))?;
+    u64::try_from(bytes).map_err(|_| anyhow!("module payload exceeds u64"))
+}
+
+fn vector_stage_processed_bytes(vector_len: usize, poly_len: usize) -> Result<u64> {
     let fold_bytes_one_track = logical_tensor_bytes(vector_len, poly_len)?;
     let fold_bytes = fold_bytes_one_track.saturating_mul(2);
-    let domain = active_cross_term_domain(cross_term_domain, poly_len);
-    let cross_term_bytes = cross_term_processed_bytes(domain, ntt_enabled)?;
+    let cross_term_bytes = module_payload_bytes(poly_len)?.saturating_mul(2);
     Ok(fold_bytes.saturating_add(cross_term_bytes))
 }
 
-fn poly_stage_processed_bytes(
-    vector_len: usize,
-    poly_len: usize,
-    cross_term_domain: usize,
-    ntt_enabled: bool,
-) -> Result<u64> {
-    // Odd/even fold runs after vector fold, so vector_len and poly_len are halved.
-    let next_vector_len = vector_len / 2;
-    let fold_bytes_one_track = logical_tensor_bytes(next_vector_len, poly_len)?;
+fn poly_stage_processed_bytes(vector_len: usize, poly_len: usize) -> Result<u64> {
+    let next_vector_len = (vector_len / 2).max(1);
+    let next_poly_len = (poly_len / 2).max(1);
+    let fold_bytes_one_track = logical_tensor_bytes(next_vector_len, next_poly_len)?;
     let fold_bytes = fold_bytes_one_track.saturating_mul(2);
-    let domain = active_cross_term_domain(cross_term_domain, poly_len / 2);
-    let cross_term_bytes = cross_term_processed_bytes(domain, ntt_enabled)?;
+    let cross_term_bytes = module_payload_bytes(next_poly_len)?.saturating_mul(2);
     Ok(fold_bytes.saturating_add(cross_term_bytes))
-}
-
-fn resolve_cross_term_domain_for_bench(poly_len: usize) -> usize {
-    let configured = env::var("DAMASCUS_CROSS_TERM_DOMAIN")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= 64)
-        .unwrap_or(2048);
-    floor_pow2(configured.min(poly_len)).max(1)
-}
-
-fn active_cross_term_domain(base_domain: usize, stage_poly_len: usize) -> usize {
-    floor_pow2(base_domain.min(stage_poly_len)).max(1)
-}
-
-fn cross_term_processed_bytes(domain: usize, ntt_enabled: bool) -> Result<u64> {
-    // Two spectral evaluations (message + blinding), each consuming lhs+rhs signatures.
-    let effective_signal_len = if ntt_enabled {
-        ntt_convolution_len(domain)?
-    } else {
-        domain
-    };
-    let elements = (effective_signal_len as u128)
-        .checked_mul(4)
-        .ok_or_else(|| anyhow!("cross-term element count overflow"))?;
-    let bytes = elements
-        .checked_mul(8)
-        .ok_or_else(|| anyhow!("cross-term byte count overflow"))?;
-    u64::try_from(bytes).map_err(|_| anyhow!("cross-term bytes exceed u64"))
-}
-
-fn ntt_convolution_len(domain: usize) -> Result<usize> {
-    if domain <= 1 {
-        return Ok(1);
-    }
-    let out_len = domain
-        .checked_mul(2)
-        .and_then(|v| v.checked_sub(1))
-        .ok_or_else(|| anyhow!("NTT output length overflow for domain {}", domain))?;
-    Ok(out_len.next_power_of_two())
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -879,72 +829,29 @@ fn progress_bar(done: usize, total: usize, width: usize) -> String {
 
 #[derive(Clone, Copy, Debug)]
 struct DerivedLayout {
+    coeff_count: usize,
     vector_len: usize,
     poly_len: usize,
     rounds: usize,
-    logical_square_len: usize,
 }
 
 fn derive_layout(input_size_bytes: u64) -> DerivedLayout {
-    let words =
-        usize::try_from((input_size_bytes.saturating_add(7) / 8).max(1)).unwrap_or(usize::MAX);
-
-    // The protocol currently requires a square tensor, so the natural side length is the
-    // smallest power of two whose square can hold the entire file without wrapping.
-    let required_square_len = pad_pow2(ceil_sqrt(words).max(2));
-    let configured_min_square_len = env::var("DAMASCUS_POLY_LEN")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .map(|v| pad_pow2(v.max(2)))
-        .unwrap_or(2);
-    let logical_square_len = required_square_len.max(configured_min_square_len);
-    let configured_max_vector = env::var("DAMASCUS_MAX_TENSOR_DIM")
-        .ok()
-        .or_else(|| env::var("DAMASCUS_MAX_VECTOR_LEN").ok())
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= 2)
-        .map(|v| floor_pow2(v).max(2));
-    let square_len = configured_max_vector
-        .map(|max_vector_len| logical_square_len.min(max_vector_len))
-        .unwrap_or(logical_square_len);
-    let rounds = floor_log2(square_len);
+    let coeff_count = coeff_count_for_byte_len(input_size_bytes);
+    let vector_len = vector_len_for_file_size(input_size_bytes).unwrap_or(1);
+    let poly_len = POLY_DEGREE;
+    let rounds = floor_log2(vector_len.max(poly_len));
 
     DerivedLayout {
-        vector_len: square_len,
-        poly_len: square_len,
+        coeff_count,
+        vector_len,
+        poly_len,
         rounds,
-        logical_square_len,
     }
-}
-
-fn ceil_sqrt(value: usize) -> usize {
-    if value <= 1 {
-        return value;
-    }
-
-    let target = value as u128;
-    let mut low = 1usize;
-    let mut high = 1usize;
-    while (high as u128).saturating_mul(high as u128) < target {
-        high = high.saturating_mul(2);
-    }
-
-    while low < high {
-        let mid = low + (high - low) / 2;
-        if (mid as u128).saturating_mul(mid as u128) < target {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-
-    low
 }
 
 fn params_from_layout(layout: &DerivedLayout) -> SystemParams {
     SystemParams {
-        module_rank: 4,
+        module_rank: MODULE_RANK,
         vector_len: layout.vector_len,
         poly_len: layout.poly_len,
         rounds: layout.rounds,
@@ -958,24 +865,6 @@ fn floor_log2(x: usize) -> usize {
         0
     } else {
         (usize::BITS as usize - 1) - (x.leading_zeros() as usize)
-    }
-}
-
-fn pad_pow2(value: usize) -> usize {
-    if value <= 1 {
-        1
-    } else {
-        value
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX / 2 + 1)
-    }
-}
-
-fn floor_pow2(value: usize) -> usize {
-    if value <= 1 {
-        1
-    } else {
-        1usize << floor_log2(value)
     }
 }
 

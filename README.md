@@ -1,107 +1,78 @@
-# Damascus-conv Rust Prototype
+# Damascus Fold Rust Prototype
 
-本仓库已按 `agent.md` 重构为单核心库工程，目标是实现 Damascus-conv（Damascus-2D/Tensor）协议原型，并支持：
+This repository is a Rust prototype that tracks the Damascus Fold paper semantics around:
 
-- Module-SIS 风格承诺
-- 双重折叠：Vector Folding + Odd-Even Poly Folding
-- Fiat-Shamir Transcript（Blake3）
-- NTT 可开关的多项式乘法
-- 大文件 mmap + 流式映射到固定内存状态
-- Criterion 基准 + CSV/Markdown 报告输出
+- `R_q = Z_q[X] / (X^n + 1)` ring arithmetic
+- `R_q^k` linear commitments
+- full-file witness expansion instead of fixed-size streaming accumulation
+- two-stage fold/replay with Fiat-Shamir challenges
 
-## 目录结构
+The current hard parameters are:
+
+- `q = 5192296858534827628530496329220021`
+- `n = 64`
+- `k = 8`
+- `bytes_per_coeff = 13`
+
+Parameter rationale is documented in [docs/params.md](docs/params.md).
+
+## Repository Layout
 
 ```text
 .
-├── Cargo.toml
 ├── benches/
 │   └── protocol_bench.rs
+├── docs/
+│   ├── divergences.md
+│   └── params.md
 ├── examples/
 │   └── full_flow.rs
-└── src/
-    ├── lib.rs
-    ├── algebra/
-    │   ├── field.rs
-    │   ├── ntt.rs
-    │   └── poly.rs
-    ├── commitment/
-    │   ├── hasher.rs
-    │   └── sis.rs
-    ├── protocol/
-    │   ├── prover.rs
-    │   ├── verifier.rs
-    │   └── transcript.rs
-    └── utils/
-        ├── config.rs
-        └── io.rs
+├── src/
+│   ├── algebra/
+│   ├── commitment/
+│   ├── protocol/
+│   └── utils/
+└── Cargo.toml
 ```
 
-## 快速开始
-
-### 1) 编译
+## Build And Run
 
 ```powershell
-cargo build
-```
-
-### 2) 运行端到端示例
-
-```powershell
-cargo run --example full_flow -- .\sample.txt
-```
-
-不传文件路径时会自动生成 `target/full_flow_input.bin`。
-
-## NTT 开关
-
-NTT 通过运行时配置 `RuntimeConfig::ntt_enabled` 控制：
-
-- `true`: 使用 NTT 卷积（规模较大时自动走 NTT）
-- `false`: 回退到朴素乘法
-
-示例中可通过环境变量切换：
-
-```powershell
-$env:DAMASCUS_NTT="1"
-cargo run --example full_flow -- .\sample.txt
-
-$env:DAMASCUS_NTT="0"
-cargo run --example full_flow -- .\sample.txt
-```
-
-## 测试
-
-```powershell
+cargo build --release
 cargo test
+cargo run --example full_flow -- .\sample.bin
 ```
 
-## 基准测试
+If no input path is provided, the example generates `target/full_flow_input.bin`.
+
+## Benchmark
 
 ```powershell
 cargo bench --bench protocol_bench
 ```
 
-基准会覆盖以下文件规模并测试 NTT ON/OFF：
+By default the benchmark generates files in `target/bench-inputs/` and writes reports to `target/bench-reports/`.
 
-- 100 MB
-- 500 MB
-- 1 GB
-- 2 GB
-- 4 GB
+Useful environment variables:
 
-输出报告位置：
+- `DAMASCUS_BENCH_CASE_SIZES=1MiB,8MiB,16MiB`
+- `DAMASCUS_BENCH_FILES=<path1>;<path2>`
+- `DAMASCUS_BENCH_FILE_LIST=<file-with-paths>`
+- `DAMASCUS_NTT=0|1`
+- `DAMASCUS_GPU=0|1`
 
-- `target/bench-reports/protocol_metrics.csv`
-- `target/bench-reports/protocol_metrics.md`
+With honest preprocessing enabled, preprocessing throughput is expected to drop sharply compared with the earlier fixed-accumulator prototype. That is the intended behavior.
 
-表头格式：
+## Implementation Notes
 
-| File Size | Mode (NTT) | Preprocessing (s) | Vec Fold (ms) | Poly Fold (ms) | Verify (us) | Cross-Term Size (Bytes) |
-| --- | --- | --- | --- | --- | --- | --- |
+- `FieldElement` is serialized as fixed-width 16-byte little-endian data.
+- `RingElement` uses negacyclic multiplication in `Z_q[X] / (X^n + 1)`.
+- `Commitment::commit` returns a module element in `R_q^8`, not a scalar hash or digest.
+- File preprocessing expands the whole file into witness coefficients and pads with zeros; it does not use `% capacity` style accumulation.
+- `Statement` stores `file_id`, `original_len_bytes`, `d`, `com_0`, `g_0_seed`, and `h_0_seed`.
+- Verification replays both fold stages and checks the terminal opening against the folded generators.
 
-## 实现说明
+## Historical Notes
 
-- 有限域：Goldilocks prime field
-- 承诺：按 seed 派生生成元，按需计算，不预生成全量大参数
-- 预处理：`memmap2` 映射文件，按 8 字节流式映射并累加到固定 `vector_len * poly_len` 状态，避免 GB 文件直接膨胀到超大 `Vec<FieldElement>`
-- 验证：`DamascusVerifier::update_commitment` 仅使用 micro-block 中的常数大小对象更新承诺
+- Legacy multi-crate experimental code under `crates/` has been retired from the active implementation path.
+- Historical divergences and their correction commits are tracked in [docs/divergences.md](docs/divergences.md).
