@@ -277,10 +277,9 @@ mod tests {
         assert_eq!(c1, c2);
     }
 
-    #[test]
-    fn commitment_preserves_ring_linearity() {
+    fn commitment_linearity_holds_for_rank<const K: usize>() {
         let mut rng = StdRng::seed_from_u64(12);
-        let committer = GenericModuleSisCommitter::<4>::new(GenericSisParams { seed: [9u8; 32] })
+        let committer = GenericModuleSisCommitter::<K>::new(GenericSisParams { seed: [9u8; 32] })
             .expect("committer");
 
         let witness_a = (0..4).map(|_| random_poly(&mut rng)).collect::<Vec<_>>();
@@ -304,6 +303,12 @@ mod tests {
             .and_then(|left| left.add(&c_b.ring_mul(&ring_b)?))
             .expect("rhs");
         assert_eq!(c_lin, rhs);
+    }
+
+    #[test]
+    fn commitment_preserves_ring_linearity_across_supported_module_ranks() {
+        commitment_linearity_holds_for_rank::<4>();
+        commitment_linearity_holds_for_rank::<8>();
     }
 
     #[test]

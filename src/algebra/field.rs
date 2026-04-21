@@ -20,6 +20,8 @@ const LIMB_MASK: u128 = (1u128 << LIMB_BITS) - 1;
 const PSEUDO_MERSENNE_C: u128 = 75;
 
 impl Fp {
+    pub const SERDE_BYTES: usize = 16;
+
     pub const fn modulus() -> u128 {
         MSIS_Q
     }

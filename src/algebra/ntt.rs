@@ -417,4 +417,19 @@ mod tests {
         let naive = naive_negacyclic(&lhs, &rhs);
         assert_eq!(ntt, naive);
     }
+
+    #[test]
+    fn negacyclic_multiply_matches_naive_across_power_of_two_sizes() {
+        for &len in &[2usize, 4, 8, 16, 32, POLY_DEGREE] {
+            let lhs = (0..len)
+                .map(|idx| Fp::from(((idx * 5) + 1) as u64))
+                .collect::<Vec<_>>();
+            let rhs = (0..len)
+                .map(|idx| Fp::from(((idx * 7) + 3) as u64))
+                .collect::<Vec<_>>();
+            let ntt = negacyclic_multiply(&lhs, &rhs).expect("ntt mul");
+            let naive = naive_negacyclic(&lhs, &rhs);
+            assert_eq!(ntt, naive, "ring length {len} mismatch");
+        }
+    }
 }

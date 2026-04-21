@@ -391,8 +391,9 @@ fn fold_poly_module(
 
 #[cfg(test)]
 mod tests {
-    use super::DamascusProver;
+    use super::{DamascusProver, RoundRecord};
     use crate::protocol::verifier::DamascusVerifier;
+    use crate::utils::config::MODULE_RANK;
     use crate::utils::config::{RuntimeConfig, SystemParams};
     use std::fs;
 
@@ -480,5 +481,88 @@ mod tests {
             .verify_final_opening(&opening)
             .expect_err("tampered transcript must fail");
         assert!(err.to_string().contains("mismatch") || err.to_string().contains("opening"));
+    }
+
+    #[test]
+    fn round_record_serialization_matches_module_payload_scale() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file = temp_dir.path().join("sized.bin");
+        write_pattern_file(&file, 8192, 13);
+
+        let params = SystemParams::default();
+        let mut prover = DamascusProver::initialize(&file, params).expect("prover");
+        let out = prover.fold_round(0).expect("first fold");
+        let encoded = bincode::serialize(&out.micro_block).expect("serialize");
+        let coeff_count = [
+            &out.micro_block.l_vec,
+            &out.micro_block.r_vec,
+            &out.micro_block.l_poly,
+            &out.micro_block.r_poly,
+        ]
+        .into_iter()
+        .map(|term| {
+            term.coords
+                .iter()
+                .map(|coord| coord.coeffs.len())
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+        let raw_coeff_bytes = coeff_count * crate::algebra::field::Fp::SERDE_BYTES;
+        assert!(
+            encoded.len() >= raw_coeff_bytes,
+            "round record was unexpectedly compressed: {} < {}",
+            encoded.len(),
+            raw_coeff_bytes
+        );
+        assert!(
+            encoded.len() >= 4 * MODULE_RANK * 32 * crate::algebra::field::Fp::SERDE_BYTES,
+            "round record is too small for four module-valued cross-terms"
+        );
+    }
+
+    #[test]
+    fn serialized_round_record_byte_flip_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file = temp_dir.path().join("tamper.bin");
+        write_pattern_file(&file, 8192, 21);
+
+        let params = SystemParams::default();
+        let mut prover = DamascusProver::initialize(&file, params.clone()).expect("prover");
+        let mut verifier =
+            DamascusVerifier::new(params, prover.statement().clone()).expect("verifier");
+
+        let out = prover.fold_round(0).expect("fold");
+        let opening_rounds = prover.rounds_total();
+        let mut rest = Vec::new();
+        for round in 1..opening_rounds {
+            rest.push(prover.fold_round(round).expect("later fold").micro_block);
+        }
+        let opening = prover.final_opening().expect("final opening");
+
+        let mut encoded = bincode::serialize(&out.micro_block).expect("serialize");
+        let flip_idx = encoded
+            .len()
+            .saturating_sub(crate::algebra::field::Fp::SERDE_BYTES / 2);
+        encoded[flip_idx] ^= 0x01;
+
+        match bincode::deserialize::<RoundRecord>(&encoded) {
+            Ok(record) => {
+                verifier
+                    .update_commitment(&record)
+                    .expect("tampered round should still deserialize");
+                for record in &rest {
+                    verifier
+                        .update_commitment(record)
+                        .expect("replay remainder");
+                }
+                let err = verifier
+                    .verify_final_opening(&opening)
+                    .expect_err("tampered serialized record must fail");
+                assert!(
+                    err.to_string().contains("mismatch") || err.to_string().contains("opening")
+                );
+            }
+            Err(_) => {}
+        }
     }
 }
