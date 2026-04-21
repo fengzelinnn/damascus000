@@ -25,6 +25,7 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(2_097_152);
     let runtime = RuntimeConfig {
+        max_preprocess_bytes: usize::MAX,
         ntt_enabled,
         parallel_enabled: true,
         gpu_enabled,
@@ -188,6 +189,7 @@ fn params_from_layout(layout: &DerivedLayout) -> SystemParams {
         poly_len: layout.poly_len,
         rounds,
         seed_generators: [11u8; 32],
+        epoch_seed: [13u8; 32],
     }
 }
 

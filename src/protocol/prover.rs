@@ -440,7 +440,7 @@ fn flatten_polys_u64(polys: &[Poly], poly_len: usize, parallel_enabled: bool) ->
 fn unflatten_polys_u64(flat: &[u64], rows: usize, poly_len: usize) -> Vec<Poly> {
     flat.chunks_exact(poly_len)
         .take(rows)
-        .map(|chunk| Poly::new(chunk.iter().copied().map(Fp).collect()))
+        .map(|chunk| Poly::new(chunk.iter().copied().map(Fp::from).collect()))
         .collect()
 }
 

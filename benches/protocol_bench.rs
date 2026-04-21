@@ -160,6 +160,7 @@ fn run_single_scenario(
     let derived = derive_layout(file_size_bytes);
     let params = params_from_layout(&derived);
     let runtime = RuntimeConfig {
+        max_preprocess_bytes: usize::MAX,
         ntt_enabled,
         parallel_enabled: true,
         gpu_enabled,
@@ -948,6 +949,7 @@ fn params_from_layout(layout: &DerivedLayout) -> SystemParams {
         poly_len: layout.poly_len,
         rounds: layout.rounds,
         seed_generators: [29u8; 32],
+        epoch_seed: [31u8; 32],
     }
 }
 

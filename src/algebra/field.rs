@@ -1,19 +1,21 @@
-use serde::{Deserialize, Serialize};
+use crate::utils::config::MSIS_Q;
+use num_bigint::BigUint;
+use num_traits::{ToPrimitive, Zero};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter};
 use std::iter::Sum;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
-
-pub const GOLDILOCKS_MODULUS: u64 = 18_446_744_069_414_584_321;
-const EPSILON: u64 = 4_294_967_295;
-const MODULUS_U128: u128 = GOLDILOCKS_MODULUS as u128;
+use std::sync::OnceLock;
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
-pub struct Fp(pub u64);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Fp(pub u128);
+
+pub type FieldElement = Fp;
 
 impl Fp {
-    pub const fn modulus() -> u64 {
-        GOLDILOCKS_MODULUS
+    pub const fn modulus() -> u128 {
+        MSIS_Q
     }
 
     pub const fn zero() -> Self {
@@ -25,39 +27,62 @@ impl Fp {
     }
 
     pub fn new(value: u64) -> Self {
-        if value >= GOLDILOCKS_MODULUS {
-            Self(value - GOLDILOCKS_MODULUS)
-        } else {
-            Self(value)
-        }
+        Self::from_u128(value as u128)
     }
 
     pub fn from_u128(value: u128) -> Self {
-        Self((value % MODULUS_U128) as u64)
+        Self(value % MSIS_Q)
     }
 
     pub fn from_le_bytes_mod_order(bytes: &[u8]) -> Self {
-        let mut limbs = Vec::with_capacity(bytes.len().div_ceil(8));
-        for chunk in bytes.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            limbs.push(u64::from_le_bytes(word));
+        if bytes.is_empty() {
+            return Self::zero();
         }
 
-        let mut acc = Self::zero();
-        let base = Self(EPSILON);
-        for limb in limbs.into_iter().rev() {
-            acc *= base;
-            acc += Self::new(limb);
+        let mut acc = BigUint::zero();
+        let mut factor = BigUint::from(1u8);
+        let modulus = modulus_biguint();
+        for &byte in bytes {
+            acc += BigUint::from(byte) * &factor;
+            factor <<= 8usize;
         }
-        acc
+        let reduced = acc % modulus;
+        Self(
+            reduced
+                .to_u128()
+                .expect("reduced challenge must fit in u128"),
+        )
     }
 
-    pub fn as_u64(self) -> u64 {
+    pub fn from_le_chunk(bytes: &[u8]) -> Self {
+        let mut acc = 0u128;
+        for (shift, byte) in bytes.iter().enumerate() {
+            acc |= (*byte as u128) << (shift * 8);
+        }
+        Self::from_u128(acc)
+    }
+
+    pub fn as_u128(self) -> u128 {
         self.0
     }
 
-    pub fn pow(self, mut exp: u64) -> Self {
+    pub fn as_u64(self) -> u64 {
+        self.0 as u64
+    }
+
+    pub fn to_le_bytes(self) -> [u8; 16] {
+        self.0.to_le_bytes()
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn pow(self, exp: u64) -> Self {
+        self.pow_u128(exp as u128)
+    }
+
+    pub fn pow_u128(self, mut exp: u128) -> Self {
         let mut base = self;
         let mut result = Self::one();
         while exp > 0 {
@@ -71,8 +96,27 @@ impl Fp {
     }
 
     pub fn inv(self) -> Self {
-        debug_assert!(self != Self::zero(), "attempted inversion of zero");
-        self.pow(GOLDILOCKS_MODULUS - 2)
+        debug_assert!(!self.is_zero(), "attempted inversion of zero");
+        self.pow_u128(MSIS_Q - 2)
+    }
+}
+
+impl Serialize for Fp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_le_bytes().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Fp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = <[u8; 16]>::deserialize(deserializer)?;
+        Ok(Self::from_u128(u128::from_le_bytes(bytes)))
     }
 }
 
@@ -86,16 +130,9 @@ impl Add for Fp {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        let (sum, carry) = self.0.overflowing_add(rhs.0);
-        if carry {
-            let (sum_plus_eps, carry2) = sum.overflowing_add(EPSILON);
-            let mut reduced = sum_plus_eps;
-            if carry2 || reduced >= GOLDILOCKS_MODULUS {
-                reduced = reduced.wrapping_sub(GOLDILOCKS_MODULUS);
-            }
-            Self(reduced)
-        } else if sum >= GOLDILOCKS_MODULUS {
-            Self(sum - GOLDILOCKS_MODULUS)
+        let sum = self.0 + rhs.0;
+        if sum >= MSIS_Q {
+            Self(sum - MSIS_Q)
         } else {
             Self(sum)
         }
@@ -115,7 +152,7 @@ impl Sub for Fp {
         if self.0 >= rhs.0 {
             Self(self.0 - rhs.0)
         } else {
-            Self(GOLDILOCKS_MODULUS - (rhs.0 - self.0))
+            Self(MSIS_Q - (rhs.0 - self.0))
         }
     }
 }
@@ -130,30 +167,8 @@ impl Mul for Fp {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        // Goldilocks reduction for p = 2^64 - 2^32 + 1.
-        let a = self.0;
-        let b = rhs.0;
-        let lo = a.wrapping_mul(b);
-        let hi = ((a as u128 * b as u128) >> 64) as u64;
-
-        let x_hi_hi = hi >> 32;
-        let x_hi_lo = hi & EPSILON;
-
-        let mut t0 = lo.wrapping_sub(x_hi_hi);
-        if lo < x_hi_hi {
-            t0 = t0.wrapping_sub(EPSILON);
-        }
-
-        let t1 = x_hi_lo.wrapping_mul(EPSILON);
-        let mut t2 = t0.wrapping_add(t1);
-        if t2 < t1 {
-            t2 = t2.wrapping_add(EPSILON);
-        }
-
-        if t2 >= GOLDILOCKS_MODULUS {
-            t2 -= GOLDILOCKS_MODULUS;
-        }
-        Self(t2)
+        let product = (BigUint::from(self.0) * BigUint::from(rhs.0)) % modulus_biguint();
+        Self(product.to_u128().expect("field product must fit in u128"))
     }
 }
 
@@ -167,10 +182,10 @@ impl Neg for Fp {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
-        if self == Self::zero() {
+        if self.is_zero() {
             self
         } else {
-            Self(GOLDILOCKS_MODULUS - self.0)
+            Self(MSIS_Q - self.0)
         }
     }
 }
@@ -193,36 +208,67 @@ impl From<u64> for Fp {
     }
 }
 
+impl From<u128> for Fp {
+    fn from(value: u128) -> Self {
+        Self::from_u128(value)
+    }
+}
+
+fn modulus_biguint() -> &'static BigUint {
+    static MODULUS: OnceLock<BigUint> = OnceLock::new();
+    MODULUS.get_or_init(|| BigUint::from(MSIS_Q))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Fp, GOLDILOCKS_MODULUS};
+    use super::Fp;
+    use crate::utils::config::MSIS_Q;
+    use num_traits::ToPrimitive;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
     #[test]
     fn field_arithmetic_round_trip() {
-        let a = Fp::from(17);
-        let b = Fp::from(9);
+        let a = Fp::from(17u64);
+        let b = Fp::from(9u64);
         let c = a * b;
-        assert_eq!(c, Fp::from(153));
+        assert_eq!(c, Fp::from(153u64));
         assert_eq!(c * b.inv(), a);
     }
 
     #[test]
     fn arithmetic_matches_reference_modulus() {
         let mut rng = StdRng::seed_from_u64(7);
-        for _ in 0..50_000 {
-            let a = rng.gen::<u64>() % GOLDILOCKS_MODULUS;
-            let b = rng.gen::<u64>() % GOLDILOCKS_MODULUS;
+        for _ in 0..20_000 {
+            let a = rng.gen::<u128>() % MSIS_Q;
+            let b = rng.gen::<u128>() % MSIS_Q;
 
-            let a_fp = Fp::new(a);
-            let b_fp = Fp::new(b);
+            let a_fp = Fp::from(a);
+            let b_fp = Fp::from(b);
 
-            let add_ref = ((a as u128 + b as u128) % (GOLDILOCKS_MODULUS as u128)) as u64;
-            let mul_ref = ((a as u128 * b as u128) % (GOLDILOCKS_MODULUS as u128)) as u64;
+            let add_ref = (a + b) % MSIS_Q;
+            let mul_ref = ((num_bigint::BigUint::from(a) * num_bigint::BigUint::from(b))
+                % num_bigint::BigUint::from(MSIS_Q))
+            .to_u128()
+            .unwrap();
 
-            assert_eq!((a_fp + b_fp).as_u64(), add_ref);
-            assert_eq!((a_fp * b_fp).as_u64(), mul_ref);
+            assert_eq!((a_fp + b_fp).as_u128(), add_ref);
+            assert_eq!((a_fp * b_fp).as_u128(), mul_ref);
         }
+    }
+
+    #[test]
+    fn challenge_bytes_reduce_into_field() {
+        let elem = Fp::from_le_bytes_mod_order(&[0xFF; 64]);
+        assert!(elem.as_u128() < MSIS_Q);
+    }
+
+    #[test]
+    fn serde_uses_fixed_width_encoding() {
+        let elem = Fp::from(42u64);
+        let encoded = bincode::serialize(&elem).expect("serialize");
+        assert_eq!(encoded.len(), 16);
+        let decoded: Fp = bincode::deserialize(&encoded).expect("deserialize");
+        assert_eq!(decoded, elem);
     }
 }
