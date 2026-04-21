@@ -1,4 +1,4 @@
-﻿use crate::algebra::field::Fp;
+use crate::algebra::field::Fp;
 use crate::commitment::sis::ModuleCommitment;
 
 #[derive(Clone, Debug)]
@@ -26,12 +26,14 @@ impl RandomOracle {
     }
 
     pub fn absorb_field(&mut self, value: Fp) {
-        self.absorb_u64(value.as_u64());
+        self.absorb_bytes(&value.to_le_bytes());
     }
 
     pub fn absorb_commitment(&mut self, commitment: &ModuleCommitment) {
-        for c in &commitment.elems {
-            self.absorb_field(*c);
+        for coord in &commitment.coords {
+            for coeff in &coord.coeffs {
+                self.absorb_field(*coeff);
+            }
         }
     }
 

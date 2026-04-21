@@ -87,7 +87,6 @@ impl DamascusProver {
         );
 
         let committer = ModuleSisCommitter::new(SisParams {
-            module_rank: params.module_rank,
             seed: params.seed_generators,
         })?;
 
