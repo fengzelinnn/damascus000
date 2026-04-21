@@ -1,7 +1,7 @@
 use crate::algebra::field::Fp;
 use crate::algebra::ntt;
 use crate::algebra::poly::Poly;
-use crate::commitment::sis::{ModuleCommitment, ModuleSisCommitter, SisParams};
+use crate::commitment::sis::{DamascusStatement, ModuleCommitment, ModuleSisCommitter, SisParams};
 use crate::protocol::transcript::Transcript;
 use crate::utils::config::{RuntimeConfig, SystemParams};
 use crate::utils::gpu;
@@ -47,6 +47,7 @@ pub struct DamascusProver {
     params: SystemParams,
     config: RuntimeConfig,
     committer: ModuleSisCommitter,
+    statement: DamascusStatement,
     transcript: Transcript,
     witness: WitnessState,
     current_commitment: ModuleCommitment,
@@ -67,42 +68,43 @@ impl DamascusProver {
         params.validate()?;
 
         let mmap = io::mmap_file(file_path)?;
-        let message = io::mmap_to_fixed_polys(&mmap, params.vector_len, params.poly_len);
+        let expanded = io::expand_file_to_square_polys(&mmap, config.max_preprocess_bytes)
+            .context("expand file into square witness")?;
+        params.vector_len = expanded.vector_len;
+        params.poly_len = expanded.ring_len;
+        params.rounds = expanded.depth;
 
-        let max_rounds_from_vector = floor_log2(params.vector_len);
-        let max_rounds_from_poly = floor_log2(params.poly_len);
-        let max_rounds = max_rounds_from_vector.min(max_rounds_from_poly);
-
-        if params.rounds == 0 {
-            params.rounds = max_rounds;
-        } else {
-            params.rounds = params.rounds.min(max_rounds);
-        }
+        let message = expanded.message;
 
         let blinding = io::sample_blinding_polys(
             message.len(),
-            params.poly_len,
+            expanded.ring_len,
             params.seed_generators,
-            mmap.len() as u64,
+            expanded.file_id,
         );
 
         let committer = ModuleSisCommitter::new(SisParams {
             seed: params.seed_generators,
         })?;
 
-        let current_commitment = if config.parallel_enabled && config.gpu_enabled {
-            committer.commit(&message, &blinding)
-        } else {
-            committer.commit_serial(&message, &blinding)
-        }
-        .context("initial commitment failed")?;
+        let statement = committer
+            .register(
+                expanded.file_id,
+                expanded.original_len_bytes,
+                expanded.depth,
+                &message,
+                &blinding,
+            )
+            .context("register initial statement failed")?;
+        let current_commitment = statement.com_0.clone();
         let transcript = Transcript::new(&params, &current_commitment);
-        let cross_term_domain = resolve_cross_term_domain(params.poly_len);
+        let cross_term_domain = resolve_cross_term_domain(expanded.ring_len);
 
         Ok(Self {
             params,
             config,
             committer,
+            statement,
             transcript,
             witness: WitnessState { message, blinding },
             current_commitment,
@@ -121,6 +123,10 @@ impl DamascusProver {
 
     pub fn current_commitment(&self) -> &ModuleCommitment {
         &self.current_commitment
+    }
+
+    pub fn statement(&self) -> &DamascusStatement {
+        &self.statement
     }
 
     pub fn fold_round(&mut self, round_idx: usize) -> Result<RoundOutput> {
@@ -423,13 +429,15 @@ fn flatten_polys_u64(polys: &[Poly], poly_len: usize, parallel_enabled: bool) ->
         out.par_chunks_mut(poly_len)
             .zip(polys.par_iter())
             .for_each(|(dst, poly)| {
-                let src = fp_slice_as_u64(&poly.coeffs);
-                dst.copy_from_slice(src);
+                for (slot, coeff) in dst.iter_mut().zip(poly.coeffs.iter()) {
+                    *slot = coeff.as_u64();
+                }
             });
     } else {
         for (dst, poly) in out.chunks_mut(poly_len).zip(polys.iter()) {
-            let src = fp_slice_as_u64(&poly.coeffs);
-            dst.copy_from_slice(src);
+            for (slot, coeff) in dst.iter_mut().zip(poly.coeffs.iter()) {
+                *slot = coeff.as_u64();
+            }
         }
     }
 
@@ -589,12 +597,6 @@ fn sample_weight(row_idx: usize, sample_idx: usize) -> Fp {
     Fp::new(raw)
 }
 
-#[inline]
-fn fp_slice_as_u64(coeffs: &[Fp]) -> &[u64] {
-    // Fp is repr(transparent) over u64, so reinterpretation is layout-safe.
-    unsafe { std::slice::from_raw_parts(coeffs.as_ptr() as *const u64, coeffs.len()) }
-}
-
 fn resolve_cross_term_domain(poly_len: usize) -> usize {
     let configured = env::var("DAMASCUS_CROSS_TERM_DOMAIN")
         .ok()
@@ -617,5 +619,54 @@ fn floor_pow2(x: usize) -> usize {
         1
     } else {
         1usize << floor_log2(x)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DamascusProver;
+    use crate::utils::config::{RuntimeConfig, SystemParams};
+    use std::fs;
+
+    fn write_pattern_file(path: &std::path::Path, size: usize, tweak: u8) {
+        let payload = (0..size)
+            .map(|idx| (idx as u8).wrapping_mul(17).wrapping_add(tweak))
+            .collect::<Vec<_>>();
+        fs::write(path, payload).expect("write pattern file");
+    }
+
+    #[test]
+    fn distinct_megabyte_files_produce_distinct_initial_commitments() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_a = temp_dir.path().join("a.bin");
+        let file_b = temp_dir.path().join("b.bin");
+        write_pattern_file(&file_a, 1 << 20, 3);
+        write_pattern_file(&file_b, 1 << 20, 4);
+
+        let prover_a = DamascusProver::initialize(&file_a, SystemParams::default()).expect("a");
+        let prover_b = DamascusProver::initialize(&file_b, SystemParams::default()).expect("b");
+        assert_ne!(prover_a.current_commitment(), prover_b.current_commitment());
+        assert_ne!(prover_a.statement().file_id, prover_b.statement().file_id);
+    }
+
+    #[test]
+    fn initialize_errors_when_full_expansion_exceeds_memory_limit() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file = temp_dir.path().join("big.bin");
+        write_pattern_file(&file, 1 << 20, 7);
+
+        let err = DamascusProver::initialize_with_config(
+            &file,
+            SystemParams::default(),
+            RuntimeConfig {
+                max_preprocess_bytes: 1024,
+                ..RuntimeConfig::default()
+            },
+        )
+        .expect_err("must fail");
+        assert!(
+            err.to_string().contains("max_preprocess_bytes")
+                || err.to_string().contains("expand file")
+        );
     }
 }

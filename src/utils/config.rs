@@ -6,14 +6,14 @@ pub const POLY_DEGREE: usize = 64;
 pub const MODULE_RANK: usize = 8;
 pub const BYTES_PER_COEFF: usize = 13;
 pub const CRT_PRIMES: [u64; 8] = [
-    2_147_483_137,
-    2_147_479_937,
-    2_147_479_681,
-    2_147_478_017,
-    2_147_477_249,
-    2_147_475_713,
-    2_147_473_921,
-    2_147_473_409,
+    3_892_314_113,
+    2_281_701_377,
+    2_013_265_921,
+    2_885_681_153,
+    2_483_027_969,
+    1_811_939_329,
+    469_762_049,
+    4_194_304_001,
 ];
 pub const DEFAULT_GENERATOR_SEED: [u8; 32] = [7u8; 32];
 pub const DEFAULT_EPOCH_SEED: [u8; 32] = [11u8; 32];

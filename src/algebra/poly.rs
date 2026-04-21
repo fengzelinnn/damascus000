@@ -1,6 +1,5 @@
 use crate::algebra::field::Fp;
 use crate::algebra::ntt;
-use crate::utils::config::POLY_DEGREE;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
@@ -163,8 +162,8 @@ impl Poly {
 
 fn assert_valid_ring_len(len: usize) {
     assert!(
-        len > 0 && len <= POLY_DEGREE && len.is_power_of_two(),
-        "ring degree must be a power of two in 1..={POLY_DEGREE}, got {len}"
+        len > 0 && len.is_power_of_two(),
+        "ring degree must be a power of two, got {len}"
     );
 }
 

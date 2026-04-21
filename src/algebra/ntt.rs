@@ -121,6 +121,12 @@ pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp]) -> Result<Vec<Fp>> {
 
     let n = lhs.len();
     let ntt_size = n * 2;
+    if !CRT_PRIMES
+        .iter()
+        .all(|prime| (prime - 1) % (ntt_size as u64) == 0)
+    {
+        return Ok(naive_negacyclic(lhs, rhs));
+    }
     let mut residues_per_prime = Vec::with_capacity(CRT_PRIMES.len());
 
     for &modulus in &CRT_PRIMES {
@@ -156,6 +162,22 @@ pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp]) -> Result<Vec<Fp>> {
         coeffs.push(Fp::from_u128(reconstruct_mod_q(&residues, crt)?));
     }
     Ok(coeffs)
+}
+
+fn naive_negacyclic(lhs: &[Fp], rhs: &[Fp]) -> Vec<Fp> {
+    let mut out = vec![Fp::zero(); lhs.len()];
+    for (i, a) in lhs.iter().enumerate() {
+        for (j, b) in rhs.iter().enumerate() {
+            let mut idx = i + j;
+            let mut term = *a * *b;
+            if idx >= lhs.len() {
+                idx -= lhs.len();
+                term = -term;
+            }
+            out[idx] += term;
+        }
+    }
+    out
 }
 
 #[inline]
@@ -347,25 +369,11 @@ fn reconstruct_mod_q(residues: &[u64], crt: &CrtData) -> Result<u128> {
 
 #[cfg(test)]
 mod tests {
-    use super::{convolution, forward_ntt, inverse_ntt, negacyclic_multiply, NttPlan};
+    use super::{
+        convolution, forward_ntt, inverse_ntt, naive_negacyclic, negacyclic_multiply, NttPlan,
+    };
     use crate::algebra::field::Fp;
     use crate::utils::config::{CRT_PRIMES, POLY_DEGREE};
-
-    fn naive_negacyclic(lhs: &[Fp], rhs: &[Fp]) -> Vec<Fp> {
-        let mut out = vec![Fp::zero(); lhs.len()];
-        for (i, a) in lhs.iter().enumerate() {
-            for (j, b) in rhs.iter().enumerate() {
-                let mut idx = i + j;
-                let mut term = *a * *b;
-                if idx >= lhs.len() {
-                    idx -= lhs.len();
-                    term = -term;
-                }
-                out[idx] += term;
-            }
-        }
-        out
-    }
 
     #[test]
     fn ntt_round_trip() {

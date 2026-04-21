@@ -13,6 +13,12 @@ pub struct Fp(pub u128);
 
 pub type FieldElement = Fp;
 
+const TWO_POW_112: u128 = 1u128 << 112;
+const MASK_112: u128 = TWO_POW_112 - 1;
+const LIMB_BITS: u32 = 56;
+const LIMB_MASK: u128 = (1u128 << LIMB_BITS) - 1;
+const PSEUDO_MERSENNE_C: u128 = 75;
+
 impl Fp {
     pub const fn modulus() -> u128 {
         MSIS_Q
@@ -167,8 +173,7 @@ impl Mul for Fp {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        let product = (BigUint::from(self.0) * BigUint::from(rhs.0)) % modulus_biguint();
-        Self(product.to_u128().expect("field product must fit in u128"))
+        Self(mul_reduce(self.0, rhs.0))
     }
 }
 
@@ -217,6 +222,37 @@ impl From<u128> for Fp {
 fn modulus_biguint() -> &'static BigUint {
     static MODULUS: OnceLock<BigUint> = OnceLock::new();
     MODULUS.get_or_init(|| BigUint::from(MSIS_Q))
+}
+
+fn mul_reduce(lhs: u128, rhs: u128) -> u128 {
+    let a0 = lhs & LIMB_MASK;
+    let a1 = lhs >> LIMB_BITS;
+    let b0 = rhs & LIMB_MASK;
+    let b1 = rhs >> LIMB_BITS;
+
+    let c0 = a0 * b0;
+    let c1 = a0 * b1 + a1 * b0;
+    let c2 = a1 * b1;
+
+    let c1_lo = c1 & LIMB_MASK;
+    let c1_hi = c1 >> LIMB_BITS;
+
+    let low_sum = c0 + (c1_lo << LIMB_BITS);
+    let low = low_sum & MASK_112;
+    let carry = low_sum >> 112;
+    let high = c2 + c1_hi + carry;
+
+    reduce_pseudo_mersenne(low, high)
+}
+
+fn reduce_pseudo_mersenne(low: u128, high: u128) -> u128 {
+    let mut acc = low + high * PSEUDO_MERSENNE_C;
+    let hi = acc >> 112;
+    acc = (acc & MASK_112) + hi * PSEUDO_MERSENNE_C;
+    while acc >= MSIS_Q {
+        acc -= MSIS_Q;
+    }
+    acc
 }
 
 #[cfg(test)]
