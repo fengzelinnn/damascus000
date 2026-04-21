@@ -11,7 +11,7 @@ This file records the main mismatches found during the paper-alignment rewrite a
 | V5 | Fold cross-terms were not carried as full module elements and round payloads were too small | `b5fce2e`, `b439a19` |
 | V6 | Fiat-Shamir derivation lacked the final paper-style domain-separated replay tests | `b5fce2e`, `b439a19` |
 | V7 | Commitment arithmetic did not run over the negacyclic ring implementation | `555911b`, `da0c2de` |
-| V8 | Legacy experimental implementations remained under `crates/` after the root crate became the active path | `PENDING_PHASE6_CLEANUP` |
+| V8 | Legacy experimental implementations remained under `crates/` after the root crate became the active path | `5af480a` |
 
 ## Current Note
 
