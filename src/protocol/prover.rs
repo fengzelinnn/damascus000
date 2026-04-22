@@ -112,6 +112,10 @@ impl DamascusProver {
         &self.current_commitment
     }
 
+    pub fn current_dimensions(&self) -> (usize, usize) {
+        (self.witness.message.len(), self.witness.message[0].len())
+    }
+
     pub fn statement(&self) -> &DamascusStatement {
         &self.statement
     }
@@ -258,6 +262,12 @@ impl DamascusProver {
     }
 }
 
+pub fn depth_j(d: usize, j: usize) -> (usize, usize) {
+    assert!(j <= d, "round index exceeds fold depth");
+    let dim = 1usize << (d - j);
+    (dim, dim)
+}
+
 fn cross_term_vec(
     committer: &ModuleSisCommitter,
     witness: &[Poly],
@@ -336,12 +346,15 @@ fn fold_poly_module(
 #[cfg(test)]
 mod tests {
     use super::{
-        fold_poly_module, fold_poly_poly, fold_vec_module, fold_vec_poly,
+        depth_j, fold_poly_module, fold_poly_poly, fold_vec_module, fold_vec_poly,
         odd_even_vec_module_scaled, odd_even_vec_poly, DamascusProver, RoundRecord,
     };
+    use crate::commitment::sis::{DamascusStatement, ModuleCommitment};
     use crate::protocol::verifier::DamascusVerifier;
-    use crate::utils::config::MODULE_RANK;
-    use crate::utils::config::{RuntimeConfig, SystemParams};
+    use crate::utils::config::{
+        RuntimeConfig, SystemParams, BYTES_PER_COEFF, MIN_FOLD_DEPTH, MODULE_RANK,
+    };
+    use crate::utils::io::square_witness_layout_for_byte_len;
     use std::fs;
 
     fn write_pattern_file(path: &std::path::Path, size: usize, tweak: u8) {
@@ -349,6 +362,37 @@ mod tests {
             .map(|idx| (idx as u8).wrapping_mul(17).wrapping_add(tweak))
             .collect::<Vec<_>>();
         fs::write(path, payload).expect("write pattern file");
+    }
+
+    fn byte_len_for_depth(d: usize) -> usize {
+        assert!(d >= MIN_FOLD_DEPTH);
+        if d == MIN_FOLD_DEPTH {
+            1
+        } else {
+            ((1usize << (2 * (d - 1))) + 1) * BYTES_PER_COEFF
+        }
+    }
+
+    fn zero_statement_for_depth(d: usize) -> DamascusStatement {
+        DamascusStatement {
+            file_id: [d as u8; 32],
+            original_len_bytes: byte_len_for_depth(d) as u64,
+            d,
+            com_0: ModuleCommitment::zero(1 << d),
+            g_0_seed: [17u8; 32],
+        }
+    }
+
+    fn zero_round_record(d: usize, round: usize) -> RoundRecord {
+        let current = depth_j(d, round);
+        let next = depth_j(d, round + 1);
+        RoundRecord {
+            round,
+            l_vec: ModuleCommitment::zero(current.1),
+            r_vec: ModuleCommitment::zero(current.1),
+            l_poly: ModuleCommitment::zero(next.1),
+            r_poly: ModuleCommitment::zero(next.1),
+        }
     }
 
     #[test]
@@ -576,6 +620,145 @@ mod tests {
                 );
             }
             Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn dual_dimension_fold_halves_each_round_and_round_record_size_tracks_ring_degree() {
+        for &d in &[6usize, 8, 10] {
+            let byte_len = byte_len_for_depth(d);
+            let layout = square_witness_layout_for_byte_len(byte_len as u64).expect("layout");
+            assert_eq!(layout.depth, d);
+
+            let params = SystemParams::default();
+            let mut verifier =
+                DamascusVerifier::new(params, zero_statement_for_depth(d)).expect("verifier");
+
+            let mut total_coeffs = (1usize << d) * (1usize << d);
+            for round in 0..d {
+                let expected = depth_j(d, round);
+                assert_eq!(verifier.current_dimensions(), expected);
+
+                let record = zero_round_record(d, round);
+                verifier.update_commitment(&record).expect("replay round");
+                let encoded = bincode::serialize(&record).expect("serialize");
+                println!(
+                    "depth={d} round={round} N_j={} n_j={} record_bytes={}",
+                    expected.0,
+                    expected.1,
+                    encoded.len()
+                );
+                let min_record_bytes =
+                    2 * MODULE_RANK * expected.1 * crate::algebra::field::Fp::SERDE_BYTES;
+                assert!(
+                    encoded.len() >= min_record_bytes,
+                    "round {round} record too small: {} < {}",
+                    encoded.len(),
+                    min_record_bytes
+                );
+
+                let next = depth_j(d, round + 1);
+                assert_eq!(verifier.current_dimensions(), next);
+
+                let next_total_coeffs = next.0 * next.1;
+                assert_eq!(next_total_coeffs * 4, total_coeffs);
+                total_coeffs = next_total_coeffs;
+            }
+
+            assert_eq!(depth_j(d, d), (1, 1));
+            let opening = crate::algebra::FieldElement::zero();
+            verifier
+                .verify_final_opening(&opening)
+                .expect("final verify");
+        }
+    }
+
+    #[test]
+    fn e2e_succeeds_across_depth_sweep() {
+        for &d in &[6usize, 7, 8, 9, 10] {
+            let params = SystemParams::default();
+            let mut verifier =
+                DamascusVerifier::new(params, zero_statement_for_depth(d)).expect("verifier");
+
+            for round in 0..d {
+                verifier
+                    .update_commitment(&zero_round_record(d, round))
+                    .expect("replay");
+            }
+
+            let opening = crate::algebra::FieldElement::zero();
+            verifier
+                .verify_final_opening(&opening)
+                .expect("verify final opening");
+        }
+    }
+
+    #[test]
+    fn every_serialized_micro_block_byte_flip_is_rejected() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file = temp_dir.path().join("full-byte-fuzz.bin");
+        write_pattern_file(&file, 8192, 41);
+
+        let params = SystemParams::default();
+        let mut prover = DamascusProver::initialize(&file, params.clone()).expect("prover");
+        let statement = prover.statement().clone();
+        let mut records = Vec::new();
+        for round in 0..prover.rounds_total() {
+            records.push(prover.fold_round(round).expect("fold").micro_block);
+        }
+        let opening = prover.final_opening().expect("final opening");
+        let mut verifier =
+            DamascusVerifier::new(params.clone(), statement.clone()).expect("verifier");
+        let mut verifier_prefixes = Vec::with_capacity(records.len());
+        for record in &records {
+            verifier_prefixes.push(verifier.clone());
+            verifier
+                .update_commitment(record)
+                .expect("replay honest prefix");
+        }
+        let encoded_records = records
+            .iter()
+            .map(|record| bincode::serialize(record).expect("serialize"))
+            .collect::<Vec<_>>();
+
+        for (record_idx, encoded) in encoded_records.iter().enumerate() {
+            for byte_idx in 0..encoded.len() {
+                let mut tampered = encoded.clone();
+                tampered[byte_idx] ^= 0x01;
+
+                let mut verifier = verifier_prefixes[record_idx].clone();
+                let mut rejected = false;
+
+                let candidate = match bincode::deserialize::<RoundRecord>(&tampered) {
+                    Ok(record) => record,
+                    Err(_) => {
+                        rejected = true;
+                        records[record_idx].clone()
+                    }
+                };
+
+                if !rejected && verifier.update_commitment(&candidate).is_err() {
+                    rejected = true;
+                }
+
+                if !rejected {
+                    for original in records.iter().skip(record_idx + 1) {
+                        if verifier.update_commitment(original).is_err() {
+                            rejected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !rejected && verifier.verify_final_opening(&opening).is_err() {
+                    rejected = true;
+                }
+
+                assert!(
+                    rejected,
+                    "tampered record {record_idx} byte {byte_idx} was accepted"
+                );
+            }
         }
     }
 }

@@ -50,6 +50,10 @@ impl DamascusVerifier {
         self.round
     }
 
+    pub fn current_dimensions(&self) -> (usize, usize) {
+        (self.g.len(), self.current_commitment.ring_len())
+    }
+
     pub fn update_commitment(&mut self, record: &RoundRecord) -> Result<()> {
         ensure!(record.round == self.round, "round mismatch in round record");
         let (vector_fold_commitment, folded_g) = if self.g.len() > 1 {
