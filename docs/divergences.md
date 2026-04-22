@@ -12,9 +12,16 @@ This file records the main mismatches found during the paper-alignment rewrite a
 | V6 | Fiat-Shamir derivation lacked the final paper-style domain-separated replay tests | `b5fce2e`, `b439a19` |
 | V7 | Commitment arithmetic did not run over the negacyclic ring implementation | `555911b`, `da0c2de` |
 | V8 | Legacy experimental implementations remained under `crates/` after the root crate became the active path | `5af480a` |
+| V9 | Commitment path still carried blinding witnesses and an auxiliary `h` family even though the PoST model only needed binding | `2c86bbf` |
 
-## Current Note
+## V2 Finalization
 
-The active implementation no longer uses the earlier fixed-dimension accumulator path. File preprocessing expands the file into witness coefficients, pads with zeros, and commits over module-valued ring data.
+The second-round correction closes the last V2 gap. The active implementation no longer fixes the
+ring degree at `n = 64`; preprocessing now chooses the smallest `d >= 6` such that
+`N_0 = n_0 = 2^d` can hold the file coefficients, and the fold path halves both dimensions every
+round until `N_d = n_d = 1`.
 
-One remaining prototype-level simplification is that the active code fixes the ring degree at `n = 64` and grows the witness vector with file size, instead of rebuilding both dimensions as `N_0 = n_0 = 2^d` for every input. That simplification is documented here so the repository state stays auditable.
+Relevant commits:
+
+- `555a060`: square witness expansion with `N_0 = n_0 = 2^d`
+- `00969de`: explicit dual-dimension fold invariants, depth helper, and sweep tests

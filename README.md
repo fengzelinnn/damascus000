@@ -4,13 +4,13 @@ This repository is a Rust prototype that tracks the Damascus Fold paper semantic
 
 - `R_q = Z_q[X] / (X^n + 1)` ring arithmetic
 - `R_q^k` linear commitments
-- full-file witness expansion instead of fixed-size streaming accumulation
+- full-file witness expansion with square layout `N_0 = n_0 = 2^d`
 - two-stage fold/replay with Fiat-Shamir challenges
 
 The current hard parameters are:
 
 - `q = 5192296858534827628530496329220021`
-- `n = 64`
+- `n_0 = N_0 = 2^d`, with minimum `d = 6`
 - `k = 8`
 - `bytes_per_coeff = 13`
 
@@ -52,6 +52,8 @@ cargo bench --bench protocol_bench
 ```
 
 By default the benchmark generates files in `target/bench-inputs/` and writes reports to `target/bench-reports/`.
+The benchmarked transcript no longer includes blinding terms, so proof-size and runtime numbers are
+not directly comparable to paper tables that include hiding overhead.
 
 Useful environment variables:
 
@@ -66,11 +68,12 @@ With honest preprocessing enabled, preprocessing throughput is expected to drop 
 ## Implementation Notes
 
 - `FieldElement` is serialized as fixed-width 16-byte little-endian data.
-- `RingElement` uses negacyclic multiplication in `Z_q[X] / (X^n + 1)`.
+- `RingElement` uses negacyclic multiplication in `Z_q[X] / (X^n + 1)` at the current round degree.
 - `Commitment::commit` returns a module element in `R_q^8`, not a scalar hash or digest.
-- File preprocessing expands the whole file into witness coefficients and pads with zeros; it does not use `% capacity` style accumulation.
-- `Statement` stores `file_id`, `original_len_bytes`, `d`, `com_0`, `g_0_seed`, and `h_0_seed`.
-- Verification replays both fold stages and checks the terminal opening against the folded generators.
+- File preprocessing expands the whole file into witness coefficients, pads with zeros, and chooses the smallest square witness that satisfies `N_0 = n_0 = 2^d`.
+- `Statement` stores `file_id`, `original_len_bytes`, `d`, `com_0`, and `g_0_seed`.
+- The commitment path is binding-only: the prototype does not include a hiding/blinding witness.
+- Verification replays both fold stages and checks the terminal scalar opening `m*` against the folded generator chain.
 
 ## Historical Notes
 
