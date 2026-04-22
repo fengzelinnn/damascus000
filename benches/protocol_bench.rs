@@ -1,7 +1,7 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use damascus_core::utils::{
-    config::{MODULE_RANK, POLY_DEGREE},
+    config::{MIN_RING_DEGREE, MODULE_RANK},
     io::{coeff_count_for_byte_len, vector_len_for_file_size},
 };
 use damascus_core::{
@@ -838,7 +838,7 @@ struct DerivedLayout {
 fn derive_layout(input_size_bytes: u64) -> DerivedLayout {
     let coeff_count = coeff_count_for_byte_len(input_size_bytes);
     let vector_len = vector_len_for_file_size(input_size_bytes).unwrap_or(1);
-    let poly_len = POLY_DEGREE;
+    let poly_len = MIN_RING_DEGREE;
     let rounds = floor_log2(vector_len.max(poly_len));
 
     DerivedLayout {

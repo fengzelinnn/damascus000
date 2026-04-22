@@ -243,13 +243,13 @@ mod tests {
     use crate::algebra::field::Fp;
     use crate::algebra::module::ModuleElement;
     use crate::algebra::poly::Poly;
-    use crate::utils::config::POLY_DEGREE;
+    use crate::utils::config::MIN_RING_DEGREE;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
     fn random_poly(rng: &mut StdRng) -> Poly {
         Poly::new(
-            (0..POLY_DEGREE)
+            (0..MIN_RING_DEGREE)
                 .map(|_| Fp::from(rng.gen::<u128>()))
                 .collect(),
         )
@@ -270,8 +270,8 @@ mod tests {
     fn commitment_is_deterministic() {
         let params = SisParams { seed: [42u8; 32] };
         let committer = ModuleSisCommitter::new(params).expect("committer");
-        let witness = vec![Poly::zero(POLY_DEGREE), Poly::zero(POLY_DEGREE)];
-        let blinding = vec![Poly::zero(POLY_DEGREE), Poly::zero(POLY_DEGREE)];
+        let witness = vec![Poly::zero(MIN_RING_DEGREE), Poly::zero(MIN_RING_DEGREE)];
+        let blinding = vec![Poly::zero(MIN_RING_DEGREE), Poly::zero(MIN_RING_DEGREE)];
         let c1 = committer.commit(&witness, &blinding).expect("c1");
         let c2 = committer.commit(&witness, &blinding).expect("c2");
         assert_eq!(c1, c2);
@@ -314,7 +314,9 @@ mod tests {
     #[test]
     fn generator_family_is_module_valued() {
         let committer = ModuleSisCommitter::new(SisParams { seed: [1u8; 32] }).expect("committer");
-        let families = committer.generators_for(2, POLY_DEGREE).expect("families");
+        let families = committer
+            .generators_for(2, MIN_RING_DEGREE)
+            .expect("families");
         assert_eq!(families.g.len(), 2);
         assert_eq!(
             families.g[0],

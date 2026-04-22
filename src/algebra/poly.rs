@@ -171,7 +171,7 @@ fn assert_valid_ring_len(len: usize) {
 mod tests {
     use super::Poly;
     use crate::algebra::field::Fp;
-    use crate::utils::config::POLY_DEGREE;
+    use crate::utils::config::MIN_RING_DEGREE;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -208,11 +208,11 @@ mod tests {
 
     #[test]
     fn x_n_plus_one_vanishes() {
-        let mut acc = Poly::one(POLY_DEGREE);
-        for _ in 0..POLY_DEGREE {
+        let mut acc = Poly::one(MIN_RING_DEGREE);
+        for _ in 0..MIN_RING_DEGREE {
             acc = acc.mul_by_x().expect("shift");
         }
-        let zero = acc.add(&Poly::one(POLY_DEGREE)).expect("add");
+        let zero = acc.add(&Poly::one(MIN_RING_DEGREE)).expect("add");
         assert!(zero.coeffs.iter().all(|coeff| coeff.is_zero()));
     }
 
@@ -220,15 +220,15 @@ mod tests {
     fn scalar_unit_inverse_restores_ring_element() {
         let mut rng = StdRng::seed_from_u64(9);
         for _ in 0..32 {
-            let a = random_ring(&mut rng, POLY_DEGREE);
+            let a = random_ring(&mut rng, MIN_RING_DEGREE);
             let scalar = loop {
                 let cand = Fp::from(rng.gen::<u128>());
                 if !cand.is_zero() {
                     break cand;
                 }
             };
-            let b = Poly::from_scalar(scalar, POLY_DEGREE);
-            let b_inv = Poly::from_scalar(scalar.inv(), POLY_DEGREE);
+            let b = Poly::from_scalar(scalar, MIN_RING_DEGREE);
+            let b_inv = Poly::from_scalar(scalar.inv(), MIN_RING_DEGREE);
             let recovered = a
                 .mul(&b, true)
                 .expect("ab")

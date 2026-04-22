@@ -373,7 +373,7 @@ mod tests {
         convolution, forward_ntt, inverse_ntt, naive_negacyclic, negacyclic_multiply, NttPlan,
     };
     use crate::algebra::field::Fp;
-    use crate::utils::config::{CRT_PRIMES, POLY_DEGREE};
+    use crate::utils::config::{CRT_PRIMES, MIN_RING_DEGREE};
 
     #[test]
     fn ntt_round_trip() {
@@ -407,10 +407,10 @@ mod tests {
 
     #[test]
     fn negacyclic_multiply_matches_naive() {
-        let lhs = (0..POLY_DEGREE)
+        let lhs = (0..MIN_RING_DEGREE)
             .map(|idx| Fp::from((idx + 1) as u64))
             .collect::<Vec<_>>();
-        let rhs = (0..POLY_DEGREE)
+        let rhs = (0..MIN_RING_DEGREE)
             .map(|idx| Fp::from((idx * 3 + 5) as u64))
             .collect::<Vec<_>>();
         let ntt = negacyclic_multiply(&lhs, &rhs).expect("ntt mul");
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn negacyclic_multiply_matches_naive_across_power_of_two_sizes() {
-        for &len in &[2usize, 4, 8, 16, 32, POLY_DEGREE] {
+        for &len in &[2usize, 4, 8, 16, 32, MIN_RING_DEGREE] {
             let lhs = (0..len)
                 .map(|idx| Fp::from(((idx * 5) + 1) as u64))
                 .collect::<Vec<_>>();
@@ -430,6 +430,34 @@ mod tests {
             let ntt = negacyclic_multiply(&lhs, &rhs).expect("ntt mul");
             let naive = naive_negacyclic(&lhs, &rhs);
             assert_eq!(ntt, naive, "ring length {len} mismatch");
+        }
+    }
+
+    #[test]
+    fn ntt_roundtrip_across_runtime_sizes() {
+        for &len in &[64usize, 128, 256, 512, 1024, 2048] {
+            let mut values: Vec<u64> = (0..len as u64)
+                .map(|idx| (idx * 17 + 3) % CRT_PRIMES[0])
+                .collect();
+            let original = values.clone();
+            let plan = NttPlan::new(values.len(), CRT_PRIMES[0]).expect("plan");
+            forward_ntt(&mut values, &plan).expect("forward");
+            inverse_ntt(&mut values, &plan).expect("inverse");
+            assert_eq!(values, original, "NTT roundtrip failed for len={len}");
+        }
+    }
+
+    #[test]
+    fn negacyclic_multiply_across_runtime_sizes() {
+        for &len in &[64usize, 128, 256, 512, 1024, 2048] {
+            let mut lhs = vec![Fp::zero(); len];
+            let mut rhs = vec![Fp::zero(); len];
+            lhs[len - 1] = Fp::from(3u64);
+            rhs[1] = Fp::from(5u64);
+            let ntt = negacyclic_multiply(&lhs, &rhs).expect("ntt mul");
+            let mut expected = vec![Fp::zero(); len];
+            expected[0] = -Fp::from(15u64);
+            assert_eq!(ntt, expected, "ring length {len} mismatch");
         }
     }
 }

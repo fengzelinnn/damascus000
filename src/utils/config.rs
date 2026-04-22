@@ -2,7 +2,8 @@ use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
 pub const MSIS_Q: u128 = 5_192_296_858_534_827_628_530_496_329_220_021;
-pub const POLY_DEGREE: usize = 64;
+pub const MIN_FOLD_DEPTH: usize = 6;
+pub const MIN_RING_DEGREE: usize = 1 << MIN_FOLD_DEPTH;
 pub const MODULE_RANK: usize = 8;
 pub const BYTES_PER_COEFF: usize = 13;
 pub const CRT_PRIMES: [u64; 8] = [
@@ -33,8 +34,8 @@ impl Default for SystemParams {
     fn default() -> Self {
         Self {
             module_rank: MODULE_RANK,
-            vector_len: POLY_DEGREE,
-            poly_len: POLY_DEGREE,
+            vector_len: MIN_RING_DEGREE,
+            poly_len: MIN_RING_DEGREE,
             rounds: 0,
             seed_generators: DEFAULT_GENERATOR_SEED,
             epoch_seed: DEFAULT_EPOCH_SEED,
@@ -46,8 +47,8 @@ impl SystemParams {
     pub fn validate(&self) -> Result<()> {
         ensure!(MSIS_Q % 2 == 1, "MSIS_Q must be odd");
         ensure!(
-            POLY_DEGREE.is_power_of_two(),
-            "POLY_DEGREE must be a power of two"
+            MIN_RING_DEGREE.is_power_of_two(),
+            "minimum ring degree must be a power of two"
         );
         ensure!(MODULE_RANK > 0, "MODULE_RANK must be > 0");
         ensure!(BYTES_PER_COEFF > 0, "BYTES_PER_COEFF must be > 0");
@@ -97,13 +98,16 @@ pub struct BenchRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{SystemParams, BYTES_PER_COEFF, CRT_PRIMES, MODULE_RANK, POLY_DEGREE};
+    use super::{
+        SystemParams, BYTES_PER_COEFF, CRT_PRIMES, MIN_FOLD_DEPTH, MIN_RING_DEGREE, MODULE_RANK,
+    };
 
     #[test]
     fn hard_spec_constants_are_wired() {
         let params = SystemParams::default();
         assert!(params.validate().is_ok());
-        assert_eq!(POLY_DEGREE, 64);
+        assert_eq!(MIN_FOLD_DEPTH, 6);
+        assert_eq!(MIN_RING_DEGREE, 1 << MIN_FOLD_DEPTH);
         assert_eq!(MODULE_RANK, 8);
         assert_eq!(BYTES_PER_COEFF, 13);
         assert_eq!(CRT_PRIMES.len(), 8);

@@ -1,6 +1,6 @@
 use crate::algebra::field::Fp;
 use crate::algebra::poly::Poly;
-use crate::utils::config::{BYTES_PER_COEFF, POLY_DEGREE};
+use crate::utils::config::{BYTES_PER_COEFF, MIN_RING_DEGREE};
 use anyhow::{ensure, Context, Result};
 use memmap2::{Mmap, MmapOptions};
 use rand::RngCore;
@@ -35,7 +35,7 @@ pub fn expand_file_to_square_polys(
 ) -> Result<ExpandedFile> {
     let file_id = *blake3::hash(mmap).as_bytes();
     let coeff_count = coeff_count_for_byte_len(mmap.len() as u64);
-    let ring_len = POLY_DEGREE;
+    let ring_len = MIN_RING_DEGREE;
     let vector_len =
         vector_len_for_coeff_count(coeff_count).context("vector witness dimension overflow")?;
     let required_coeff_capacity = vector_len
@@ -79,7 +79,7 @@ pub fn coeff_count_for_byte_len(byte_len: u64) -> usize {
 
 pub fn vector_len_for_coeff_count(coeff_count: usize) -> Option<usize> {
     coeff_count
-        .div_ceil(POLY_DEGREE)
+        .div_ceil(MIN_RING_DEGREE)
         .max(1)
         .checked_next_power_of_two()
 }
@@ -124,7 +124,7 @@ fn floor_log2(x: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{expand_file_to_square_polys, mmap_file};
-    use crate::utils::config::{BYTES_PER_COEFF, POLY_DEGREE};
+    use crate::utils::config::{BYTES_PER_COEFF, MIN_RING_DEGREE};
     use std::fs;
 
     #[test]
@@ -137,8 +137,8 @@ mod tests {
         let expanded = expand_file_to_square_polys(&mmap, usize::MAX).expect("expand");
         assert_eq!(expanded.original_len_bytes, payload.len() as u64);
         assert_eq!(expanded.message.len(), 1);
-        assert_eq!(expanded.message[0].len(), POLY_DEGREE);
-        assert_eq!(expanded.ring_len, POLY_DEGREE);
+        assert_eq!(expanded.message[0].len(), MIN_RING_DEGREE);
+        assert_eq!(expanded.ring_len, MIN_RING_DEGREE);
     }
 
     #[test]

@@ -94,21 +94,21 @@ mod tests {
     use super::{sample_nonzero_challenge, Transcript};
     use crate::algebra::field::Fp;
     use crate::commitment::sis::{DamascusStatement, ModuleCommitment};
-    use crate::utils::config::{SystemParams, POLY_DEGREE};
+    use crate::utils::config::{SystemParams, MIN_RING_DEGREE};
 
     fn sample_statement() -> DamascusStatement {
         DamascusStatement {
             file_id: [3u8; 32],
             original_len_bytes: 4096,
             d: 6,
-            com_0: ModuleCommitment::zero(POLY_DEGREE),
+            com_0: ModuleCommitment::zero(MIN_RING_DEGREE),
             g_0_seed: [5u8; 32],
             h_0_seed: [7u8; 32],
         }
     }
 
     fn tagged_commitment(tag: u64) -> ModuleCommitment {
-        let mut commitment = ModuleCommitment::zero(POLY_DEGREE);
+        let mut commitment = ModuleCommitment::zero(MIN_RING_DEGREE);
         commitment.coords[0].coeffs[0] = Fp::from(tag);
         commitment.coords[1].coeffs[1] = Fp::from(tag + 1);
         commitment
