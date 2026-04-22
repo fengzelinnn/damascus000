@@ -27,7 +27,6 @@ pub struct Statement<const K: usize> {
     pub d: usize,
     pub com_0: ModuleElement<K>,
     pub g_0_seed: [u8; 32],
-    pub h_0_seed: [u8; 32],
 }
 
 pub type DamascusStatement = Statement<MODULE_RANK>;
@@ -36,13 +35,11 @@ pub type ModuleCommitment = ModuleElement<MODULE_RANK>;
 #[derive(Clone)]
 pub struct GeneratorFamilies<const K: usize> {
     pub g: Vec<ModuleElement<K>>,
-    pub h: Vec<ModuleElement<K>>,
 }
 
 pub struct GenericModuleSisCommitter<const K: usize> {
     params: GenericSisParams<K>,
     g_seed: [u8; 32],
-    h_seed: [u8; 32],
     cache: Arc<Mutex<HashMap<(usize, usize), Arc<GeneratorFamilies<K>>>>>,
 }
 
@@ -53,7 +50,6 @@ impl<const K: usize> Clone for GenericModuleSisCommitter<K> {
         Self {
             params: self.params.clone(),
             g_seed: self.g_seed,
-            h_seed: self.h_seed,
             cache: Arc::clone(&self.cache),
         }
     }
@@ -64,7 +60,6 @@ impl<const K: usize> std::fmt::Debug for GenericModuleSisCommitter<K> {
         f.debug_struct("GenericModuleSisCommitter")
             .field("params", &self.params)
             .field("g_seed", &self.g_seed)
-            .field("h_seed", &self.h_seed)
             .finish_non_exhaustive()
     }
 }
@@ -73,11 +68,9 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
     pub fn new(params: GenericSisParams<K>) -> Result<Self> {
         params.validate()?;
         let g_seed = derive_subseed(params.seed, b"g0");
-        let h_seed = derive_subseed(params.seed, b"h0");
         Ok(Self {
             params,
             g_seed,
-            h_seed,
             cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -86,8 +79,8 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         &self.params
     }
 
-    pub fn generator_seeds(&self) -> ([u8; 32], [u8; 32]) {
-        (self.g_seed, self.h_seed)
+    pub fn generator_seed(&self) -> [u8; 32] {
+        self.g_seed
     }
 
     pub fn generators_for(
@@ -107,7 +100,6 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
 
         let families = Arc::new(GeneratorFamilies {
             g: derive_generators(self.g_seed, b"g", vector_len, ring_len)?,
-            h: derive_generators(self.h_seed, b"h", vector_len, ring_len)?,
         });
         let mut guard = self.cache.lock().expect("generator cache lock poisoned");
         let entry = guard
@@ -116,40 +108,33 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         Ok(Arc::clone(entry))
     }
 
-    pub fn commit(&self, witness: &[Poly], blinding: &[Poly]) -> Result<ModuleElement<K>> {
-        ensure!(
-            witness.len() == blinding.len(),
-            "witness and blinding length mismatch"
-        );
+    pub fn commit(&self, witness: &[Poly]) -> Result<ModuleElement<K>> {
         if witness.is_empty() {
             return Ok(ModuleElement::<K>::zero(1));
         }
 
         let ring_len = witness[0].len();
         ensure!(
-            witness.iter().all(|poly| poly.len() == ring_len)
-                && blinding.iter().all(|poly| poly.len() == ring_len),
-            "witness and blinding ring lengths must be uniform"
+            witness.iter().all(|poly| poly.len() == ring_len),
+            "witness ring lengths must be uniform"
         );
 
         let families = self.generators_for(witness.len(), ring_len)?;
-        self.commit_with_generators(witness, blinding, &families.g, &families.h)
+        self.commit_with_generators(witness, &families.g)
     }
 
-    pub fn commit_serial(&self, witness: &[Poly], blinding: &[Poly]) -> Result<ModuleElement<K>> {
-        self.commit(witness, blinding)
+    pub fn commit_serial(&self, witness: &[Poly]) -> Result<ModuleElement<K>> {
+        self.commit(witness)
     }
 
     pub fn commit_with_generators(
         &self,
         witness: &[Poly],
-        blinding: &[Poly],
         g: &[ModuleElement<K>],
-        h: &[ModuleElement<K>],
     ) -> Result<ModuleElement<K>> {
         ensure!(
-            witness.len() == blinding.len() && witness.len() == g.len() && g.len() == h.len(),
-            "message/opening/generator length mismatch"
+            witness.len() == g.len(),
+            "message/generator length mismatch"
         );
         if witness.is_empty() {
             return Ok(ModuleElement::<K>::zero(1));
@@ -160,9 +145,6 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         for idx in 0..witness.len() {
             acc = acc.add(&g[idx].ring_mul(&witness[idx])?)?;
         }
-        for idx in 0..blinding.len() {
-            acc = acc.add(&h[idx].ring_mul(&blinding[idx])?)?;
-        }
         Ok(acc)
     }
 
@@ -172,29 +154,25 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         original_len_bytes: u64,
         d: usize,
         witness: &[Poly],
-        blinding: &[Poly],
     ) -> Result<Statement<K>> {
-        let com_0 = self.commit(witness, blinding)?;
+        let com_0 = self.commit(witness)?;
         Ok(Statement {
             file_id,
             original_len_bytes,
             d,
             com_0,
             g_0_seed: self.g_seed,
-            h_0_seed: self.h_seed,
         })
     }
 }
 
-pub fn derive_generator_families_from_seeds<const K: usize>(
+pub fn derive_generator_families_from_seed<const K: usize>(
     g_seed: [u8; 32],
-    h_seed: [u8; 32],
     vector_len: usize,
     ring_len: usize,
 ) -> Result<GeneratorFamilies<K>> {
     Ok(GeneratorFamilies {
         g: derive_generators(g_seed, b"g", vector_len, ring_len)?,
-        h: derive_generators(h_seed, b"h", vector_len, ring_len)?,
     })
 }
 
@@ -271,9 +249,8 @@ mod tests {
         let params = SisParams { seed: [42u8; 32] };
         let committer = ModuleSisCommitter::new(params).expect("committer");
         let witness = vec![Poly::zero(MIN_RING_DEGREE), Poly::zero(MIN_RING_DEGREE)];
-        let blinding = vec![Poly::zero(MIN_RING_DEGREE), Poly::zero(MIN_RING_DEGREE)];
-        let c1 = committer.commit(&witness, &blinding).expect("c1");
-        let c2 = committer.commit(&witness, &blinding).expect("c2");
+        let c1 = committer.commit(&witness).expect("c1");
+        let c2 = committer.commit(&witness).expect("c2");
         assert_eq!(c1, c2);
     }
 
@@ -284,19 +261,14 @@ mod tests {
 
         let witness_a = (0..4).map(|_| random_poly(&mut rng)).collect::<Vec<_>>();
         let witness_b = (0..4).map(|_| random_poly(&mut rng)).collect::<Vec<_>>();
-        let blinding_a = (0..4).map(|_| random_poly(&mut rng)).collect::<Vec<_>>();
-        let blinding_b = (0..4).map(|_| random_poly(&mut rng)).collect::<Vec<_>>();
         let ring_a = random_poly(&mut rng);
         let ring_b = random_poly(&mut rng);
 
-        let c_a = committer.commit(&witness_a, &blinding_a).expect("c_a");
-        let c_b = committer.commit(&witness_b, &blinding_b).expect("c_b");
+        let c_a = committer.commit(&witness_a).expect("c_a");
+        let c_b = committer.commit(&witness_b).expect("c_b");
 
         let witness_lin = ring_linear_combination(&witness_a, &witness_b, &ring_a, &ring_b);
-        let blinding_lin = ring_linear_combination(&blinding_a, &blinding_b, &ring_a, &ring_b);
-        let c_lin = committer
-            .commit(&witness_lin, &blinding_lin)
-            .expect("linear commitment");
+        let c_lin = committer.commit(&witness_lin).expect("linear commitment");
 
         let rhs = c_a
             .ring_mul(&ring_a)

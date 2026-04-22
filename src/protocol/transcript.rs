@@ -103,7 +103,6 @@ mod tests {
             d: 6,
             com_0: ModuleCommitment::zero(MIN_RING_DEGREE),
             g_0_seed: [5u8; 32],
-            h_0_seed: [7u8; 32],
         }
     }
 

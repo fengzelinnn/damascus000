@@ -1,10 +1,11 @@
+use crate::algebra::FieldElement;
 use crate::commitment::sis::{
-    derive_generator_families_from_seeds, DamascusStatement, ModuleCommitment,
+    derive_generator_families_from_seed, DamascusStatement, ModuleCommitment,
 };
-use crate::protocol::prover::{FinalOpening, RoundRecord};
+use crate::protocol::prover::RoundRecord;
 use crate::protocol::transcript::Transcript;
 use crate::utils::config::SystemParams;
-use crate::utils::io::vector_len_for_file_size;
+use crate::utils::io::square_witness_layout_for_byte_len;
 use anyhow::{ensure, Context, Result};
 
 #[derive(Clone, Debug)]
@@ -14,26 +15,22 @@ pub struct DamascusVerifier {
     transcript: Transcript,
     current_commitment: ModuleCommitment,
     g: Vec<ModuleCommitment>,
-    h: Vec<ModuleCommitment>,
     round: usize,
 }
 
 impl DamascusVerifier {
     pub fn new(mut params: SystemParams, statement: DamascusStatement) -> Result<Self> {
         params.validate()?;
-        let vector_len = vector_len_for_file_size(statement.original_len_bytes)
-            .context("derive initial vector length from statement")?;
+        let layout = square_witness_layout_for_byte_len(statement.original_len_bytes)
+            .context("derive initial witness layout from statement")?;
+        let vector_len = layout.dimension;
         let ring_len = statement.com_0.ring_len();
         params.vector_len = vector_len;
         params.poly_len = ring_len;
         params.rounds = statement.d;
-        let families = derive_generator_families_from_seeds(
-            statement.g_0_seed,
-            statement.h_0_seed,
-            vector_len,
-            ring_len,
-        )
-        .context("derive initial generator families")?;
+        let families =
+            derive_generator_families_from_seed(statement.g_0_seed, vector_len, ring_len)
+                .context("derive initial generator families")?;
         let transcript = Transcript::new(&params, &statement);
         Ok(Self {
             params,
@@ -41,7 +38,6 @@ impl DamascusVerifier {
             current_commitment: statement.com_0.clone(),
             statement,
             g: families.g,
-            h: families.h,
             round: 0,
         })
     }
@@ -56,12 +52,10 @@ impl DamascusVerifier {
 
     pub fn update_commitment(&mut self, record: &RoundRecord) -> Result<()> {
         ensure!(record.round == self.round, "round mismatch in round record");
-        let (vector_fold_commitment, folded_g, folded_h) = if self.g.len() > 1 {
+        let (vector_fold_commitment, folded_g) = if self.g.len() > 1 {
             let mid = self.g.len() / 2;
             let g_left = self.g[..mid].to_vec();
             let g_right = self.g[mid..].to_vec();
-            let h_left = self.h[..mid].to_vec();
-            let h_right = self.h[mid..].to_vec();
 
             let x = self.transcript.challenge_vec(
                 self.round,
@@ -75,8 +69,7 @@ impl DamascusVerifier {
                 .add(&record.l_vec.scale(x_inv)?)?
                 .add(&record.r_vec.scale(x)?)?;
             let folded_g = fold_vec_module(&g_left, &g_right, x_inv)?;
-            let folded_h = fold_vec_module(&h_left, &h_right, x_inv)?;
-            (vector_fold_commitment, folded_g, folded_h)
+            (vector_fold_commitment, folded_g)
         } else {
             let zero = ModuleCommitment::zero(self.current_commitment.ring_len());
             let _ =
@@ -86,16 +79,11 @@ impl DamascusVerifier {
                 record.l_vec == zero && record.r_vec == zero,
                 "scalar vector stage must emit zero vec cross-terms"
             );
-            (
-                self.current_commitment.clone(),
-                self.g.clone(),
-                self.h.clone(),
-            )
+            (self.current_commitment.clone(), self.g.clone())
         };
 
-        let (next_commitment, next_g, next_h) = if folded_g[0].ring_len() > 1 {
+        let (next_commitment, next_g) = if folded_g[0].ring_len() > 1 {
             let (g_even, g_odd_scaled) = odd_even_vec_module_scaled(&folded_g)?;
-            let (h_even, h_odd_scaled) = odd_even_vec_module_scaled(&folded_h)?;
             let y = self.transcript.challenge_poly(
                 self.round,
                 &vector_fold_commitment,
@@ -108,8 +96,7 @@ impl DamascusVerifier {
                 .add(&record.l_poly.scale(y_inv)?)?
                 .add(&record.r_poly.scale(y)?)?;
             let next_g = fold_poly_module(&g_even, &g_odd_scaled, y_inv)?;
-            let next_h = fold_poly_module(&h_even, &h_odd_scaled, y_inv)?;
-            (next_commitment, next_g, next_h)
+            (next_commitment, next_g)
         } else {
             let zero = ModuleCommitment::zero(1);
             let _ =
@@ -119,32 +106,25 @@ impl DamascusVerifier {
                 record.l_poly == zero && record.r_poly == zero,
                 "scalar stage must emit zero poly cross-terms"
             );
-            (vector_fold_commitment, folded_g, folded_h)
+            (vector_fold_commitment, folded_g)
         };
 
         self.current_commitment = next_commitment;
         self.g = next_g;
-        self.h = next_h;
         self.round += 1;
         Ok(())
     }
 
-    pub fn verify_final_opening(&self, opening: &FinalOpening) -> Result<()> {
+    pub fn verify_final_opening(&self, opening: &FieldElement) -> Result<()> {
         ensure!(
             self.round == self.params.rounds,
             "cannot verify final opening before all rounds replay"
         );
         ensure!(
-            self.g.len() == 1 && self.h.len() == 1,
-            "terminal generator families must have length one"
+            self.g.len() == 1,
+            "terminal generator family must have length one"
         );
-        ensure!(
-            opening.m_star.len() == 1 && opening.r_star.len() == 1,
-            "terminal opening must be scalar"
-        );
-        let rhs = self.g[0]
-            .ring_mul(&opening.m_star)?
-            .add(&self.h[0].ring_mul(&opening.r_star)?)?;
+        let rhs = self.g[0].scale(*opening)?;
         ensure!(rhs == self.current_commitment, "final opening mismatch");
         Ok(())
     }

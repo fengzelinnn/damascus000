@@ -3,9 +3,6 @@ use crate::algebra::poly::Poly;
 use crate::utils::config::{BYTES_PER_COEFF, MIN_FOLD_DEPTH};
 use anyhow::{ensure, Context, Result};
 use memmap2::{Mmap, MmapOptions};
-use rand::RngCore;
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
 use std::fs::File;
 use std::mem::size_of;
 use std::path::Path;
@@ -120,31 +117,6 @@ pub fn square_witness_layout_for_coeff_count(coeff_count: usize) -> Result<Squar
         }
         depth = depth.checked_add(1).context("witness depth overflow")?;
     }
-}
-
-pub fn sample_blinding_polys(
-    count: usize,
-    poly_len: usize,
-    seed: [u8; 32],
-    file_id: [u8; 32],
-) -> Vec<Poly> {
-    let mut nonce_seed = seed;
-    for (idx, byte) in file_id.iter().enumerate() {
-        nonce_seed[idx % nonce_seed.len()] ^= *byte;
-    }
-
-    let mut rng = ChaCha20Rng::from_seed(nonce_seed);
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut coeffs = Vec::with_capacity(poly_len);
-        for _ in 0..poly_len {
-            let hi = (rng.next_u64() as u128) << 64;
-            let lo = rng.next_u64() as u128;
-            coeffs.push(Fp::from(hi | lo));
-        }
-        out.push(Poly::new(coeffs));
-    }
-    out
 }
 
 #[cfg(test)]

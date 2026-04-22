@@ -1,5 +1,6 @@
 use crate::algebra::field::Fp;
 use crate::algebra::poly::Poly;
+use crate::algebra::FieldElement;
 use crate::commitment::sis::{DamascusStatement, ModuleCommitment, ModuleSisCommitter, SisParams};
 use crate::protocol::transcript::Transcript;
 use crate::utils::config::{RuntimeConfig, SystemParams};
@@ -28,18 +29,12 @@ pub struct RoundOutput {
     pub total_round_time: Duration,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FinalOpening {
-    pub m_star: Poly,
-    pub r_star: Poly,
-}
+pub type FinalOpening = FieldElement;
 
 #[derive(Clone, Debug)]
 struct WitnessState {
     message: Vec<Poly>,
-    blinding: Vec<Poly>,
     g: Vec<ModuleCommitment>,
-    h: Vec<ModuleCommitment>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,12 +64,6 @@ impl DamascusProver {
         let expanded = io::expand_file_to_square_polys(&mmap, config.max_preprocess_bytes)
             .context("expand file into full witness")?;
         let message = expanded.message;
-        let blinding = io::sample_blinding_polys(
-            expanded.vector_len,
-            expanded.ring_len,
-            params.seed_generators,
-            expanded.file_id,
-        );
 
         params.vector_len = expanded.vector_len;
         params.poly_len = expanded.ring_len;
@@ -92,7 +81,6 @@ impl DamascusProver {
                 expanded.original_len_bytes,
                 expanded.depth,
                 &message,
-                &blinding,
             )
             .context("register initial statement failed")?;
         let transcript = Transcript::new(&params, &statement);
@@ -105,9 +93,7 @@ impl DamascusProver {
             transcript,
             witness: WitnessState {
                 message,
-                blinding,
                 g: families.g.clone(),
-                h: families.h.clone(),
             },
             current_commitment,
             round: 0,
@@ -131,12 +117,10 @@ impl DamascusProver {
     }
 
     pub fn final_opening(&self) -> Option<FinalOpening> {
-        (self.round == self.params.rounds && self.witness.message.len() == 1).then(|| {
-            FinalOpening {
-                m_star: self.witness.message[0].clone(),
-                r_star: self.witness.blinding[0].clone(),
-            }
-        })
+        (self.round == self.params.rounds
+            && self.witness.message.len() == 1
+            && self.witness.message[0].len() == 1)
+            .then(|| self.witness.message[0].coeffs[0])
     }
 
     pub fn fold_round(&mut self, round_idx: usize) -> Result<RoundOutput> {
@@ -147,28 +131,21 @@ impl DamascusProver {
         let vector_start = Instant::now();
 
         let current_ring_len = self.witness.message[0].len();
-        let (
-            l_vec,
-            r_vec,
-            vector_fold_commitment,
-            folded_message,
-            folded_blinding,
-            folded_g,
-            folded_h,
-        ) = if self.witness.message.len() > 1 {
+        let (l_vec, r_vec, vector_fold_commitment, folded_message, folded_g) = if self
+            .witness
+            .message
+            .len()
+            > 1
+        {
             let mid = self.witness.message.len() / 2;
             let msg_left = self.witness.message[..mid].to_vec();
             let msg_right = self.witness.message[mid..].to_vec();
-            let rnd_left = self.witness.blinding[..mid].to_vec();
-            let rnd_right = self.witness.blinding[mid..].to_vec();
             let g_left = self.witness.g[..mid].to_vec();
             let g_right = self.witness.g[mid..].to_vec();
-            let h_left = self.witness.h[..mid].to_vec();
-            let h_right = self.witness.h[mid..].to_vec();
 
-            let l_vec = cross_term_vec(&self.committer, &msg_left, &rnd_left, &g_right, &h_right)
+            let l_vec = cross_term_vec(&self.committer, &msg_left, &g_right)
                 .context("left vector cross-term failed")?;
-            let r_vec = cross_term_vec(&self.committer, &msg_right, &rnd_right, &g_left, &h_left)
+            let r_vec = cross_term_vec(&self.committer, &msg_right, &g_left)
                 .context("right vector cross-term failed")?;
 
             let x =
@@ -181,12 +158,10 @@ impl DamascusProver {
                 .add(&l_vec.scale(x_inv)?)?
                 .add(&r_vec.scale(x)?)?;
             let folded_message = fold_vec_poly(&msg_left, &msg_right, x)?;
-            let folded_blinding = fold_vec_poly(&rnd_left, &rnd_right, x)?;
             let folded_g = fold_vec_module(&g_left, &g_right, x_inv)?;
-            let folded_h = fold_vec_module(&h_left, &h_right, x_inv)?;
             let vector_recomputed = self
                 .committer
-                .commit_with_generators(&folded_message, &folded_blinding, &folded_g, &folded_h)
+                .commit_with_generators(&folded_message, &folded_g)
                 .context("recompute vector stage commitment")?;
             ensure!(
                 vector_fold_commitment == vector_recomputed,
@@ -197,9 +172,7 @@ impl DamascusProver {
                 r_vec,
                 vector_fold_commitment,
                 folded_message,
-                folded_blinding,
                 folded_g,
-                folded_h,
             )
         } else {
             let zero = ModuleCommitment::zero(current_ring_len);
@@ -211,76 +184,51 @@ impl DamascusProver {
                 zero,
                 self.current_commitment.clone(),
                 self.witness.message.clone(),
-                self.witness.blinding.clone(),
                 self.witness.g.clone(),
-                self.witness.h.clone(),
             )
         };
         let vector_fold_time = vector_start.elapsed();
 
         let poly_start = Instant::now();
-        let (l_poly, r_poly, next_message, next_blinding, next_g, next_h, next_commitment) =
-            if folded_message[0].len() > 1 {
-                let (msg_even, msg_odd) = odd_even_vec_poly(&folded_message)?;
-                let (rnd_even, rnd_odd) = odd_even_vec_poly(&folded_blinding)?;
-                let (g_even, g_odd_scaled) = odd_even_vec_module_scaled(&folded_g)?;
-                let (h_even, h_odd_scaled) = odd_even_vec_module_scaled(&folded_h)?;
+        let (l_poly, r_poly, next_message, next_g, next_commitment) = if folded_message[0].len() > 1
+        {
+            let (msg_even, msg_odd) = odd_even_vec_poly(&folded_message)?;
+            let (g_even, g_odd_scaled) = odd_even_vec_module_scaled(&folded_g)?;
 
-                let l_poly = cross_term_vec(
-                    &self.committer,
-                    &msg_even,
-                    &rnd_even,
-                    &g_odd_scaled,
-                    &h_odd_scaled,
-                )
+            let l_poly = cross_term_vec(&self.committer, &msg_even, &g_odd_scaled)
                 .context("left poly cross-term failed")?;
-                let r_poly = cross_term_vec(&self.committer, &msg_odd, &rnd_odd, &g_even, &h_even)
-                    .context("right poly cross-term failed")?;
+            let r_poly = cross_term_vec(&self.committer, &msg_odd, &g_even)
+                .context("right poly cross-term failed")?;
 
-                let y = self.transcript.challenge_poly(
-                    round_idx,
-                    &vector_fold_commitment,
-                    &l_poly,
-                    &r_poly,
-                );
-                let y_inv = y.inv();
-                let (c_even, _) = vector_fold_commitment.odd_even_decomposition()?;
-                let next_commitment = c_even.add(&l_poly.scale(y_inv)?)?.add(&r_poly.scale(y)?)?;
-                let next_message = fold_poly_poly(&msg_even, &msg_odd, y)?;
-                let next_blinding = fold_poly_poly(&rnd_even, &rnd_odd, y)?;
-                let next_g = fold_poly_module(&g_even, &g_odd_scaled, y_inv)?;
-                let next_h = fold_poly_module(&h_even, &h_odd_scaled, y_inv)?;
-                (
-                    l_poly,
-                    r_poly,
-                    next_message,
-                    next_blinding,
-                    next_g,
-                    next_h,
-                    next_commitment,
-                )
-            } else {
-                let zero = ModuleCommitment::zero(1);
-                let _ = self.transcript.challenge_poly(
-                    round_idx,
-                    &vector_fold_commitment,
-                    &zero,
-                    &zero,
-                );
-                (
-                    zero.clone(),
-                    zero,
-                    folded_message,
-                    folded_blinding,
-                    folded_g,
-                    folded_h,
-                    vector_fold_commitment.clone(),
-                )
-            };
+            let y = self.transcript.challenge_poly(
+                round_idx,
+                &vector_fold_commitment,
+                &l_poly,
+                &r_poly,
+            );
+            let y_inv = y.inv();
+            let (c_even, _) = vector_fold_commitment.odd_even_decomposition()?;
+            let next_commitment = c_even.add(&l_poly.scale(y_inv)?)?.add(&r_poly.scale(y)?)?;
+            let next_message = fold_poly_poly(&msg_even, &msg_odd, y)?;
+            let next_g = fold_poly_module(&g_even, &g_odd_scaled, y_inv)?;
+            (l_poly, r_poly, next_message, next_g, next_commitment)
+        } else {
+            let zero = ModuleCommitment::zero(1);
+            let _ =
+                self.transcript
+                    .challenge_poly(round_idx, &vector_fold_commitment, &zero, &zero);
+            (
+                zero.clone(),
+                zero,
+                folded_message,
+                folded_g,
+                vector_fold_commitment.clone(),
+            )
+        };
 
         let recomputed = self
             .committer
-            .commit_with_generators(&next_message, &next_blinding, &next_g, &next_h)
+            .commit_with_generators(&next_message, &next_g)
             .context("recompute post-poly commitment")?;
         ensure!(
             next_commitment == recomputed,
@@ -290,9 +238,7 @@ impl DamascusProver {
 
         self.witness = WitnessState {
             message: next_message,
-            blinding: next_blinding,
             g: next_g,
-            h: next_h,
         };
         self.current_commitment = next_commitment;
         self.round += 1;
@@ -315,11 +261,9 @@ impl DamascusProver {
 fn cross_term_vec(
     committer: &ModuleSisCommitter,
     witness: &[Poly],
-    blinding: &[Poly],
     g: &[ModuleCommitment],
-    h: &[ModuleCommitment],
 ) -> Result<ModuleCommitment> {
-    committer.commit_with_generators(witness, blinding, g, h)
+    committer.commit_with_generators(witness, g)
 }
 
 fn fold_vec_poly(left: &[Poly], right: &[Poly], challenge: Fp) -> Result<Vec<Poly>> {
@@ -391,7 +335,10 @@ fn fold_poly_module(
 
 #[cfg(test)]
 mod tests {
-    use super::{DamascusProver, RoundRecord};
+    use super::{
+        fold_poly_module, fold_poly_poly, fold_vec_module, fold_vec_poly,
+        odd_even_vec_module_scaled, odd_even_vec_poly, DamascusProver, RoundRecord,
+    };
     use crate::protocol::verifier::DamascusVerifier;
     use crate::utils::config::MODULE_RANK;
     use crate::utils::config::{RuntimeConfig, SystemParams};
@@ -518,6 +465,72 @@ mod tests {
             encoded.len() >= 4 * MODULE_RANK * 32 * crate::algebra::field::Fp::SERDE_BYTES,
             "round record is too small for four module-valued cross-terms"
         );
+    }
+
+    #[test]
+    fn single_round_preserves_commitment_through_vector_and_poly_stages() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file = temp_dir.path().join("preserve.bin");
+        write_pattern_file(&file, 8192, 31);
+
+        let mut prover =
+            DamascusProver::initialize(&file, SystemParams::default()).expect("prover");
+        let transcript = prover.transcript.clone();
+        let current_commitment = prover.current_commitment.clone();
+        let current_message = prover.witness.message.clone();
+        let current_g = prover.witness.g.clone();
+
+        let out = prover.fold_round(0).expect("round 0");
+
+        let mid = current_message.len() / 2;
+        let msg_left = current_message[..mid].to_vec();
+        let msg_right = current_message[mid..].to_vec();
+        let g_left = current_g[..mid].to_vec();
+        let g_right = current_g[mid..].to_vec();
+
+        let x = transcript.challenge_vec(
+            0,
+            &current_commitment,
+            &out.micro_block.l_vec,
+            &out.micro_block.r_vec,
+        );
+        let x_inv = x.inv();
+        let vector_fold_commitment = current_commitment
+            .add(&out.micro_block.l_vec.scale(x_inv).expect("x^-1 * l_vec"))
+            .and_then(|c| c.add(&out.micro_block.r_vec.scale(x).expect("x * r_vec")))
+            .expect("vector fold commitment");
+        let folded_message = fold_vec_poly(&msg_left, &msg_right, x).expect("folded message");
+        let folded_g = fold_vec_module(&g_left, &g_right, x_inv).expect("folded g");
+        let vector_recomputed = prover
+            .committer
+            .commit_with_generators(&folded_message, &folded_g)
+            .expect("vector recomputed");
+        assert_eq!(vector_fold_commitment, vector_recomputed);
+
+        let (msg_even, msg_odd) = odd_even_vec_poly(&folded_message).expect("odd/even message");
+        let (g_even, g_odd_scaled) = odd_even_vec_module_scaled(&folded_g).expect("odd/even g");
+        let y = transcript.challenge_poly(
+            0,
+            &vector_fold_commitment,
+            &out.micro_block.l_poly,
+            &out.micro_block.r_poly,
+        );
+        let y_inv = y.inv();
+        let next_message = fold_poly_poly(&msg_even, &msg_odd, y).expect("next message");
+        let next_g = fold_poly_module(&g_even, &g_odd_scaled, y_inv).expect("next g");
+        let (c_even, _) = vector_fold_commitment
+            .odd_even_decomposition()
+            .expect("commitment odd/even");
+        let next_commitment = c_even
+            .add(&out.micro_block.l_poly.scale(y_inv).expect("y^-1 * l_poly"))
+            .and_then(|c| c.add(&out.micro_block.r_poly.scale(y).expect("y * r_poly")))
+            .expect("next commitment");
+        let recomputed = prover
+            .committer
+            .commit_with_generators(&next_message, &next_g)
+            .expect("poly recomputed");
+        assert_eq!(next_commitment, recomputed);
+        assert_eq!(&next_commitment, prover.current_commitment());
     }
 
     #[test]
