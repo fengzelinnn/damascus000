@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
 use damascus_core::utils::gpu;
-use damascus_core::utils::{
-    config::{MIN_RING_DEGREE, MODULE_RANK},
-    io::{coeff_count_for_byte_len, vector_len_for_file_size},
-};
+use damascus_core::utils::{config::MODULE_RANK, io::square_witness_layout_for_byte_len};
 use damascus_core::{DamascusProver, DamascusVerifier, RuntimeConfig, SystemParams};
 use std::env;
 use std::fs;
@@ -19,7 +16,7 @@ fn main() -> Result<()> {
     let input_size_bytes = fs::metadata(&file_path)
         .with_context(|| format!("read metadata for {}", file_path.display()))?
         .len();
-    let derived = derive_layout(input_size_bytes);
+    let derived = derive_layout(input_size_bytes)?;
     let params = params_from_layout(&derived);
 
     let ntt_enabled = env::var("DAMASCUS_NTT").map(|v| v != "0").unwrap_or(true);
@@ -137,18 +134,19 @@ struct DerivedLayout {
     rounds: usize,
 }
 
-fn derive_layout(input_size_bytes: u64) -> DerivedLayout {
-    let coeff_count = coeff_count_for_byte_len(input_size_bytes);
-    let vector_len = vector_len_for_file_size(input_size_bytes).unwrap_or(1);
-    let poly_len = MIN_RING_DEGREE;
-    let rounds = floor_log2(vector_len.max(poly_len));
+fn derive_layout(input_size_bytes: u64) -> Result<DerivedLayout> {
+    let layout = square_witness_layout_for_byte_len(input_size_bytes)?;
+    let coeff_count = layout.coeff_count;
+    let vector_len = layout.dimension;
+    let poly_len = layout.dimension;
+    let rounds = layout.depth;
 
-    DerivedLayout {
+    Ok(DerivedLayout {
         coeff_count,
         vector_len,
         poly_len,
         rounds,
-    }
+    })
 }
 
 fn params_from_layout(layout: &DerivedLayout) -> SystemParams {
@@ -171,12 +169,4 @@ fn human_size(bytes: u64) -> String {
         unit_idx += 1;
     }
     format!("{value:.2} {}", UNITS[unit_idx])
-}
-
-fn floor_log2(x: usize) -> usize {
-    if x <= 1 {
-        0
-    } else {
-        (usize::BITS as usize - 1) - (x.leading_zeros() as usize)
-    }
 }

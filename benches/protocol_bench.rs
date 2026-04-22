@@ -1,9 +1,6 @@
 use anyhow::{anyhow, ensure, Context, Result};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use damascus_core::utils::{
-    config::{MIN_RING_DEGREE, MODULE_RANK},
-    io::{coeff_count_for_byte_len, vector_len_for_file_size},
-};
+use damascus_core::utils::{config::MODULE_RANK, io::square_witness_layout_for_byte_len};
 use damascus_core::{
     DamascusProver, DamascusStatement, DamascusVerifier, MicroBlock, RuntimeConfig, SystemParams,
 };
@@ -836,10 +833,11 @@ struct DerivedLayout {
 }
 
 fn derive_layout(input_size_bytes: u64) -> DerivedLayout {
-    let coeff_count = coeff_count_for_byte_len(input_size_bytes);
-    let vector_len = vector_len_for_file_size(input_size_bytes).unwrap_or(1);
-    let poly_len = MIN_RING_DEGREE;
-    let rounds = floor_log2(vector_len.max(poly_len));
+    let layout = square_witness_layout_for_byte_len(input_size_bytes).expect("derive layout");
+    let coeff_count = layout.coeff_count;
+    let vector_len = layout.dimension;
+    let poly_len = layout.dimension;
+    let rounds = layout.depth;
 
     DerivedLayout {
         coeff_count,
@@ -857,14 +855,6 @@ fn params_from_layout(layout: &DerivedLayout) -> SystemParams {
         rounds: layout.rounds,
         seed_generators: [29u8; 32],
         epoch_seed: [31u8; 32],
-    }
-}
-
-fn floor_log2(x: usize) -> usize {
-    if x <= 1 {
-        0
-    } else {
-        (usize::BITS as usize - 1) - (x.leading_zeros() as usize)
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::algebra::field::Fp;
 use crate::algebra::poly::Poly;
-use crate::utils::config::{BYTES_PER_COEFF, MIN_RING_DEGREE};
+use crate::utils::config::{BYTES_PER_COEFF, MIN_FOLD_DEPTH};
 use anyhow::{ensure, Context, Result};
 use memmap2::{Mmap, MmapOptions};
 use rand::RngCore;
@@ -35,9 +35,10 @@ pub fn expand_file_to_square_polys(
 ) -> Result<ExpandedFile> {
     let file_id = *blake3::hash(mmap).as_bytes();
     let coeff_count = coeff_count_for_byte_len(mmap.len() as u64);
-    let ring_len = MIN_RING_DEGREE;
-    let vector_len =
-        vector_len_for_coeff_count(coeff_count).context("vector witness dimension overflow")?;
+    let layout = square_witness_layout_for_coeff_count(coeff_count)
+        .context("square witness dimension overflow")?;
+    let vector_len = layout.dimension;
+    let ring_len = layout.dimension;
     let required_coeff_capacity = vector_len
         .checked_mul(ring_len)
         .context("witness capacity overflow")?;
@@ -66,7 +67,7 @@ pub fn expand_file_to_square_polys(
         coeff_count,
         vector_len,
         ring_len,
-        depth: floor_log2(vector_len.max(ring_len)),
+        depth: layout.depth,
         message,
     })
 }
@@ -78,14 +79,47 @@ pub fn coeff_count_for_byte_len(byte_len: u64) -> usize {
 }
 
 pub fn vector_len_for_coeff_count(coeff_count: usize) -> Option<usize> {
-    coeff_count
-        .div_ceil(MIN_RING_DEGREE)
-        .max(1)
-        .checked_next_power_of_two()
+    square_witness_layout_for_coeff_count(coeff_count)
+        .ok()
+        .map(|layout| layout.dimension)
 }
 
 pub fn vector_len_for_file_size(byte_len: u64) -> Option<usize> {
     vector_len_for_coeff_count(coeff_count_for_byte_len(byte_len))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SquareWitnessLayout {
+    pub coeff_count: usize,
+    pub depth: usize,
+    pub dimension: usize,
+    pub capacity_coeffs: usize,
+}
+
+pub fn square_witness_layout_for_byte_len(byte_len: u64) -> Result<SquareWitnessLayout> {
+    square_witness_layout_for_coeff_count(coeff_count_for_byte_len(byte_len))
+}
+
+pub fn square_witness_layout_for_coeff_count(coeff_count: usize) -> Result<SquareWitnessLayout> {
+    let coeff_count = coeff_count.max(1);
+    let mut depth = MIN_FOLD_DEPTH;
+    loop {
+        let dimension = 1usize
+            .checked_shl(depth as u32)
+            .context("witness dimension overflow")?;
+        let capacity_coeffs = dimension
+            .checked_mul(dimension)
+            .context("witness coefficient capacity overflow")?;
+        if capacity_coeffs >= coeff_count {
+            return Ok(SquareWitnessLayout {
+                coeff_count,
+                depth,
+                dimension,
+                capacity_coeffs,
+            });
+        }
+        depth = depth.checked_add(1).context("witness depth overflow")?;
+    }
 }
 
 pub fn sample_blinding_polys(
@@ -113,18 +147,10 @@ pub fn sample_blinding_polys(
     out
 }
 
-fn floor_log2(x: usize) -> usize {
-    if x <= 1 {
-        0
-    } else {
-        (usize::BITS as usize - 1) - (x.leading_zeros() as usize)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{expand_file_to_square_polys, mmap_file};
-    use crate::utils::config::{BYTES_PER_COEFF, MIN_RING_DEGREE};
+    use super::{expand_file_to_square_polys, mmap_file, square_witness_layout_for_byte_len};
+    use crate::utils::config::{BYTES_PER_COEFF, MIN_FOLD_DEPTH};
     use std::fs;
 
     #[test]
@@ -136,9 +162,24 @@ mod tests {
         let mmap = mmap_file(&path).expect("mmap");
         let expanded = expand_file_to_square_polys(&mmap, usize::MAX).expect("expand");
         assert_eq!(expanded.original_len_bytes, payload.len() as u64);
-        assert_eq!(expanded.message.len(), 1);
-        assert_eq!(expanded.message[0].len(), MIN_RING_DEGREE);
-        assert_eq!(expanded.ring_len, MIN_RING_DEGREE);
+        assert_eq!(expanded.depth, MIN_FOLD_DEPTH);
+        assert_eq!(expanded.message.len(), 1 << expanded.depth);
+        assert_eq!(expanded.message[0].len(), 1 << expanded.depth);
+        assert_eq!(expanded.ring_len, 1 << expanded.depth);
+    }
+
+    #[test]
+    fn square_layout_expands_both_dimensions_for_large_inputs() {
+        for bytes in [128u64 * 1024 * 1024, 1024u64 * 1024 * 1024] {
+            let layout = square_witness_layout_for_byte_len(bytes).expect("layout");
+            assert_eq!(layout.dimension, 1 << layout.depth);
+            assert!(layout.depth >= MIN_FOLD_DEPTH);
+            assert!(layout.capacity_coeffs >= layout.coeff_count);
+            assert!(
+                layout.capacity_coeffs * BYTES_PER_COEFF >= bytes as usize,
+                "layout cannot hold original bytes"
+            );
+        }
     }
 
     #[test]
