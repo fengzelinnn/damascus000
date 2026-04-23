@@ -131,12 +131,14 @@ impl Poly {
         self.coeffs.iter().copied().sum()
     }
 
-    pub fn mul(&self, rhs: &Self, _ntt_enabled: bool) -> Result<Self> {
+    pub fn mul(&self, rhs: &Self, ntt_enabled: bool) -> Result<Self> {
         ensure!(self.len() == rhs.len(), "ring length mismatch");
-        Ok(Self::new(ntt::negacyclic_multiply(
-            &self.coeffs,
-            &rhs.coeffs,
-        )?))
+        let coeffs = if ntt_enabled {
+            ntt::negacyclic_multiply(&self.coeffs, &rhs.coeffs)?
+        } else {
+            ntt::naive_negacyclic(&self.coeffs, &rhs.coeffs)
+        };
+        Ok(Self::new(coeffs))
     }
 
     pub fn mul_by_x(&self) -> Result<Self> {

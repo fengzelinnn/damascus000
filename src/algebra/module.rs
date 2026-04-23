@@ -59,11 +59,16 @@ impl<const K: usize> ModuleElement<K> {
     }
 
     pub fn ring_mul(&self, scalar: &Poly) -> Result<Self> {
+        self.ring_mul_with_ntt(scalar, true)
+    }
+
+    pub fn ring_mul_with_ntt(&self, scalar: &Poly, ntt_enabled: bool) -> Result<Self> {
         ensure!(
             self.ring_len() == scalar.len(),
             "module/scalar ring length mismatch"
         );
-        let coords = array::from_fn(|idx| self.coords[idx].mul(scalar, true).expect("shape"));
+        let coords =
+            array::from_fn(|idx| self.coords[idx].mul(scalar, ntt_enabled).expect("shape"));
         Self::from_coords(coords)
     }
 

@@ -25,3 +25,5 @@ Relevant commits:
 
 - `555a060`: square witness expansion with `N_0 = n_0 = 2^d`
 - `00969de`: explicit dual-dimension fold invariants, depth helper, and sweep tests
+
+除此之外，还需要模拟cPoSt、ePoSt、storna、Maat、Lucas-PoSt在同等环境下的数据，根据论文中的描述来完成模拟，

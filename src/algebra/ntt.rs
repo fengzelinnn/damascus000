@@ -1,5 +1,6 @@
 use crate::algebra::field::Fp;
 use crate::utils::config::{CRT_PRIMES, MSIS_Q};
+use crate::utils::gpu::try_ntt_batch_gpu;
 use anyhow::{anyhow, ensure, Result};
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
@@ -127,9 +128,18 @@ pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp]) -> Result<Vec<Fp>> {
     {
         return Ok(naive_negacyclic(lhs, rhs));
     }
-    let mut residues_per_prime = Vec::with_capacity(CRT_PRIMES.len());
+    let plans = CRT_PRIMES
+        .iter()
+        .map(|&modulus| cached_plan(ntt_size, modulus))
+        .collect::<Result<Vec<_>>>()?;
+    let stage_count = ntt_size.trailing_zeros() as usize;
+    let mut batched_a = Vec::with_capacity(CRT_PRIMES.len());
+    let mut batched_b = Vec::with_capacity(CRT_PRIMES.len());
+    let mut stage_roots = Vec::with_capacity(CRT_PRIMES.len() * stage_count);
+    let mut inv_roots = Vec::with_capacity(CRT_PRIMES.len() * stage_count);
+    let mut inv_sizes = [0u64; 8];
 
-    for &modulus in &CRT_PRIMES {
+    for (prime_idx, (&modulus, plan)) in CRT_PRIMES.iter().zip(plans.iter()).enumerate() {
         let mut a = vec![0u64; ntt_size];
         let mut b = vec![0u64; ntt_size];
         for idx in 0..n {
@@ -137,20 +147,56 @@ pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp]) -> Result<Vec<Fp>> {
             b[idx] = (rhs[idx].as_u128() % (modulus as u128)) as u64;
         }
 
-        let plan = cached_plan(ntt_size, modulus)?;
-        forward_ntt(&mut a, &plan)?;
-        forward_ntt(&mut b, &plan)?;
-        for (lhs_coeff, rhs_coeff) in a.iter_mut().zip(b.iter()) {
-            *lhs_coeff = mod_mul(*lhs_coeff, *rhs_coeff, modulus);
-        }
-        inverse_ntt(&mut a, &plan)?;
-
-        let mut reduced = vec![0u64; n];
-        for idx in 0..n {
-            reduced[idx] = mod_sub(a[idx], a[idx + n], modulus);
-        }
-        residues_per_prime.push(reduced);
+        stage_roots.extend_from_slice(&plan.stage_roots);
+        inv_roots.extend_from_slice(&plan.inv_stage_roots);
+        inv_sizes[prime_idx] = plan.inv_size;
+        batched_a.push(a);
+        batched_b.push(b);
     }
+
+    let residues_per_prime = if let Some(gpu_results) = try_ntt_batch_gpu(
+        &batched_a,
+        &batched_b,
+        ntt_size,
+        &CRT_PRIMES,
+        &stage_roots,
+        &inv_roots,
+        &inv_sizes,
+    ) {
+        gpu_results
+            .into_iter()
+            .zip(CRT_PRIMES.iter())
+            .map(|(values, &modulus)| {
+                let mut reduced = vec![0u64; n];
+                for idx in 0..n {
+                    reduced[idx] = mod_sub(values[idx], values[idx + n], modulus);
+                }
+                reduced
+            })
+            .collect()
+    } else {
+        let mut residues_per_prime = Vec::with_capacity(CRT_PRIMES.len());
+        for (((mut a, mut b), plan), &modulus) in batched_a
+            .into_iter()
+            .zip(batched_b.into_iter())
+            .zip(plans.iter())
+            .zip(CRT_PRIMES.iter())
+        {
+            forward_ntt(&mut a, plan)?;
+            forward_ntt(&mut b, plan)?;
+            for (lhs_coeff, rhs_coeff) in a.iter_mut().zip(b.iter()) {
+                *lhs_coeff = mod_mul(*lhs_coeff, *rhs_coeff, modulus);
+            }
+            inverse_ntt(&mut a, plan)?;
+
+            let mut reduced = vec![0u64; n];
+            for idx in 0..n {
+                reduced[idx] = mod_sub(a[idx], a[idx + n], modulus);
+            }
+            residues_per_prime.push(reduced);
+        }
+        residues_per_prime
+    };
 
     let crt = crt_data();
     let mut coeffs = Vec::with_capacity(n);
@@ -164,7 +210,7 @@ pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp]) -> Result<Vec<Fp>> {
     Ok(coeffs)
 }
 
-fn naive_negacyclic(lhs: &[Fp], rhs: &[Fp]) -> Vec<Fp> {
+pub fn naive_negacyclic(lhs: &[Fp], rhs: &[Fp]) -> Vec<Fp> {
     let mut out = vec![Fp::zero(); lhs.len()];
     for (i, a) in lhs.iter().enumerate() {
         for (j, b) in rhs.iter().enumerate() {

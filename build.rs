@@ -5,6 +5,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=cuda/fold_kernel.cu");
+    println!("cargo:rerun-if-changed=cuda/ntt_kernel.cu");
     println!("cargo:rerun-if-env-changed=DAMASCUS_BUILD_CUDA");
     println!("cargo:rerun-if-env-changed=DAMASCUS_CL_PATH");
     println!("cargo:rustc-check-cfg=cfg(damascus_cuda_available)");
@@ -28,18 +29,25 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let lib_path = out_dir.join("damascus_cuda_fold.lib");
-    let kernel_path = PathBuf::from("cuda").join("fold_kernel.cu");
+    let kernel_paths = [
+        PathBuf::from("cuda").join("fold_kernel.cu"),
+        PathBuf::from("cuda").join("ntt_kernel.cu"),
+    ];
 
-    let status = Command::new(&nvcc_path)
+    let mut command = Command::new(&nvcc_path);
+    command
         .arg("--lib")
         .arg("-O3")
         .arg("--use_fast_math")
         .arg("-ccbin")
         .arg(&cl_path)
         .arg("-o")
-        .arg(&lib_path)
-        .arg(&kernel_path)
-        .status();
+        .arg(&lib_path);
+    for kernel_path in &kernel_paths {
+        command.arg(kernel_path);
+    }
+
+    let status = command.status();
 
     match status {
         Ok(s) if s.success() && lib_path.exists() => {

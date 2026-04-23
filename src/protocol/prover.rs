@@ -6,6 +6,7 @@ use crate::protocol::transcript::Transcript;
 use crate::utils::config::{RuntimeConfig, SystemParams};
 use crate::utils::io;
 use anyhow::{ensure, Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -46,6 +47,10 @@ pub struct DamascusProver {
     witness: WitnessState,
     current_commitment: ModuleCommitment,
     round: usize,
+    ntt_enabled: bool,
+    parallel_enabled: bool,
+    gpu_enabled: bool,
+    gpu_min_elements: usize,
 }
 
 impl DamascusProver {
@@ -76,11 +81,12 @@ impl DamascusProver {
             .generators_for(expanded.vector_len, expanded.ring_len)
             .context("derive initial generator families")?;
         let statement = committer
-            .register(
+            .register_with_ntt(
                 expanded.file_id,
                 expanded.original_len_bytes,
                 expanded.depth,
                 &message,
+                config.ntt_enabled,
             )
             .context("register initial statement failed")?;
         let transcript = Transcript::new(&params, &statement);
@@ -97,6 +103,10 @@ impl DamascusProver {
             },
             current_commitment,
             round: 0,
+            ntt_enabled: config.ntt_enabled,
+            parallel_enabled: config.parallel_enabled,
+            gpu_enabled: config.gpu_enabled,
+            gpu_min_elements: config.gpu_min_elements,
         })
     }
 
@@ -147,9 +157,9 @@ impl DamascusProver {
             let g_left = self.witness.g[..mid].to_vec();
             let g_right = self.witness.g[mid..].to_vec();
 
-            let l_vec = cross_term_vec(&self.committer, &msg_left, &g_right)
+            let l_vec = cross_term_vec(&self.committer, &msg_left, &g_right, self.ntt_enabled)
                 .context("left vector cross-term failed")?;
-            let r_vec = cross_term_vec(&self.committer, &msg_right, &g_left)
+            let r_vec = cross_term_vec(&self.committer, &msg_right, &g_left, self.ntt_enabled)
                 .context("right vector cross-term failed")?;
 
             let x =
@@ -161,11 +171,18 @@ impl DamascusProver {
                 .current_commitment
                 .add(&l_vec.scale(x_inv)?)?
                 .add(&r_vec.scale(x)?)?;
-            let folded_message = fold_vec_poly(&msg_left, &msg_right, x)?;
-            let folded_g = fold_vec_module(&g_left, &g_right, x_inv)?;
+            let folded_message = fold_vec_poly(
+                &msg_left,
+                &msg_right,
+                x,
+                self.parallel_enabled,
+                self.gpu_enabled,
+                self.gpu_min_elements,
+            )?;
+            let folded_g = fold_vec_module(&g_left, &g_right, x_inv, self.parallel_enabled)?;
             let vector_recomputed = self
                 .committer
-                .commit_with_generators(&folded_message, &folded_g)
+                .commit_with_generators_ntt(&folded_message, &folded_g, self.ntt_enabled)
                 .context("recompute vector stage commitment")?;
             ensure!(
                 vector_fold_commitment == vector_recomputed,
@@ -199,9 +216,10 @@ impl DamascusProver {
             let (msg_even, msg_odd) = odd_even_vec_poly(&folded_message)?;
             let (g_even, g_odd_scaled) = odd_even_vec_module_scaled(&folded_g)?;
 
-            let l_poly = cross_term_vec(&self.committer, &msg_even, &g_odd_scaled)
-                .context("left poly cross-term failed")?;
-            let r_poly = cross_term_vec(&self.committer, &msg_odd, &g_even)
+            let l_poly =
+                cross_term_vec(&self.committer, &msg_even, &g_odd_scaled, self.ntt_enabled)
+                    .context("left poly cross-term failed")?;
+            let r_poly = cross_term_vec(&self.committer, &msg_odd, &g_even, self.ntt_enabled)
                 .context("right poly cross-term failed")?;
 
             let y = self.transcript.challenge_poly(
@@ -213,8 +231,8 @@ impl DamascusProver {
             let y_inv = y.inv();
             let (c_even, _) = vector_fold_commitment.odd_even_decomposition()?;
             let next_commitment = c_even.add(&l_poly.scale(y_inv)?)?.add(&r_poly.scale(y)?)?;
-            let next_message = fold_poly_poly(&msg_even, &msg_odd, y)?;
-            let next_g = fold_poly_module(&g_even, &g_odd_scaled, y_inv)?;
+            let next_message = fold_poly_poly(&msg_even, &msg_odd, y, self.parallel_enabled)?;
+            let next_g = fold_poly_module(&g_even, &g_odd_scaled, y_inv, self.parallel_enabled)?;
             (l_poly, r_poly, next_message, next_g, next_commitment)
         } else {
             let zero = ModuleCommitment::zero(1);
@@ -232,7 +250,7 @@ impl DamascusProver {
 
         let recomputed = self
             .committer
-            .commit_with_generators(&next_message, &next_g)
+            .commit_with_generators_ntt(&next_message, &next_g, self.ntt_enabled)
             .context("recompute post-poly commitment")?;
         ensure!(
             next_commitment == recomputed,
@@ -272,28 +290,74 @@ fn cross_term_vec(
     committer: &ModuleSisCommitter,
     witness: &[Poly],
     g: &[ModuleCommitment],
+    ntt_enabled: bool,
 ) -> Result<ModuleCommitment> {
-    committer.commit_with_generators(witness, g)
+    committer.commit_with_generators_ntt(witness, g, ntt_enabled)
 }
 
-fn fold_vec_poly(left: &[Poly], right: &[Poly], challenge: Fp) -> Result<Vec<Poly>> {
+fn fold_vec_poly(
+    left: &[Poly],
+    right: &[Poly],
+    challenge: Fp,
+    parallel: bool,
+    gpu_enabled: bool,
+    gpu_min_elements: usize,
+) -> Result<Vec<Poly>> {
     ensure!(left.len() == right.len(), "vector fold length mismatch");
-    left.iter()
-        .zip(right.iter())
-        .map(|(l, r)| l.add(&r.scale(challenge)))
-        .collect()
+    let total_coeffs: usize = left.iter().map(|p| p.len()).sum();
+
+    if gpu_enabled && !left.is_empty() && total_coeffs >= gpu_min_elements {
+        use crate::utils::gpu::try_fold_pairs_gpu;
+
+        let left_flat: Vec<u128> = left
+            .iter()
+            .flat_map(|p| p.coeffs.iter().map(|c| c.as_u128()))
+            .collect();
+        let right_flat: Vec<u128> = right
+            .iter()
+            .flat_map(|p| p.coeffs.iter().map(|c| c.as_u128()))
+            .collect();
+        if let Some(out_flat) = try_fold_pairs_gpu(&left_flat, &right_flat, challenge.as_u128()) {
+            let poly_len = left[0].len();
+            let polys: Vec<Poly> = out_flat
+                .chunks_exact(poly_len)
+                .map(|chunk| Poly::new(chunk.iter().map(|&v| Fp::from_u128(v)).collect()))
+                .collect();
+            return Ok(polys);
+        }
+    }
+
+    if parallel {
+        left.par_iter()
+            .zip(right.par_iter())
+            .map(|(l, r)| l.add(&r.scale(challenge)))
+            .collect::<Result<Vec<_>>>()
+    } else {
+        left.iter()
+            .zip(right.iter())
+            .map(|(l, r)| l.add(&r.scale(challenge)))
+            .collect()
+    }
 }
 
 fn fold_vec_module(
     left: &[ModuleCommitment],
     right: &[ModuleCommitment],
     challenge_inv: Fp,
+    parallel: bool,
 ) -> Result<Vec<ModuleCommitment>> {
     ensure!(left.len() == right.len(), "generator fold length mismatch");
-    left.iter()
-        .zip(right.iter())
-        .map(|(l, r)| l.add_scaled(r, challenge_inv))
-        .collect()
+    if parallel {
+        left.par_iter()
+            .zip(right.par_iter())
+            .map(|(l, r)| l.add_scaled(r, challenge_inv))
+            .collect::<Result<Vec<_>>>()
+    } else {
+        left.iter()
+            .zip(right.iter())
+            .map(|(l, r)| l.add_scaled(r, challenge_inv))
+            .collect()
+    }
 }
 
 fn odd_even_vec_poly(input: &[Poly]) -> Result<(Vec<Poly>, Vec<Poly>)> {
@@ -320,27 +384,42 @@ fn odd_even_vec_module_scaled(
     Ok((even, odd))
 }
 
-fn fold_poly_poly(even: &[Poly], odd: &[Poly], challenge: Fp) -> Result<Vec<Poly>> {
+fn fold_poly_poly(even: &[Poly], odd: &[Poly], challenge: Fp, parallel: bool) -> Result<Vec<Poly>> {
     ensure!(even.len() == odd.len(), "poly fold length mismatch");
-    even.iter()
-        .zip(odd.iter())
-        .map(|(e, o)| e.add(&o.scale(challenge)))
-        .collect()
+    if parallel {
+        even.par_iter()
+            .zip(odd.par_iter())
+            .map(|(e, o)| e.add(&o.scale(challenge)))
+            .collect::<Result<Vec<_>>>()
+    } else {
+        even.iter()
+            .zip(odd.iter())
+            .map(|(e, o)| e.add(&o.scale(challenge)))
+            .collect()
+    }
 }
 
 fn fold_poly_module(
     even: &[ModuleCommitment],
     odd_scaled: &[ModuleCommitment],
     challenge_inv: Fp,
+    parallel: bool,
 ) -> Result<Vec<ModuleCommitment>> {
     ensure!(
         even.len() == odd_scaled.len(),
         "generator poly fold length mismatch"
     );
-    even.iter()
-        .zip(odd_scaled.iter())
-        .map(|(e, o)| e.add_scaled(o, challenge_inv))
-        .collect()
+    if parallel {
+        even.par_iter()
+            .zip(odd_scaled.par_iter())
+            .map(|(e, o)| e.add_scaled(o, challenge_inv))
+            .collect::<Result<Vec<_>>>()
+    } else {
+        even.iter()
+            .zip(odd_scaled.iter())
+            .map(|(e, o)| e.add_scaled(o, challenge_inv))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -543,8 +622,9 @@ mod tests {
             .add(&out.micro_block.l_vec.scale(x_inv).expect("x^-1 * l_vec"))
             .and_then(|c| c.add(&out.micro_block.r_vec.scale(x).expect("x * r_vec")))
             .expect("vector fold commitment");
-        let folded_message = fold_vec_poly(&msg_left, &msg_right, x).expect("folded message");
-        let folded_g = fold_vec_module(&g_left, &g_right, x_inv).expect("folded g");
+        let folded_message =
+            fold_vec_poly(&msg_left, &msg_right, x, false, false, 0).expect("folded message");
+        let folded_g = fold_vec_module(&g_left, &g_right, x_inv, false).expect("folded g");
         let vector_recomputed = prover
             .committer
             .commit_with_generators(&folded_message, &folded_g)
@@ -560,8 +640,8 @@ mod tests {
             &out.micro_block.r_poly,
         );
         let y_inv = y.inv();
-        let next_message = fold_poly_poly(&msg_even, &msg_odd, y).expect("next message");
-        let next_g = fold_poly_module(&g_even, &g_odd_scaled, y_inv).expect("next g");
+        let next_message = fold_poly_poly(&msg_even, &msg_odd, y, false).expect("next message");
+        let next_g = fold_poly_module(&g_even, &g_odd_scaled, y_inv, false).expect("next g");
         let (c_even, _) = vector_fold_commitment
             .odd_even_decomposition()
             .expect("commitment odd/even");
