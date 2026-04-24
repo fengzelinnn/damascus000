@@ -157,10 +157,22 @@ impl DamascusProver {
             let g_left = self.witness.g[..mid].to_vec();
             let g_right = self.witness.g[mid..].to_vec();
 
-            let l_vec = cross_term_vec(&self.committer, &msg_left, &g_right, self.ntt_enabled)
-                .context("left vector cross-term failed")?;
-            let r_vec = cross_term_vec(&self.committer, &msg_right, &g_left, self.ntt_enabled)
-                .context("right vector cross-term failed")?;
+            let l_vec = cross_term_vec(
+                &self.committer,
+                &msg_left,
+                &g_right,
+                self.ntt_enabled,
+                self.gpu_enabled,
+            )
+            .context("left vector cross-term failed")?;
+            let r_vec = cross_term_vec(
+                &self.committer,
+                &msg_right,
+                &g_left,
+                self.ntt_enabled,
+                self.gpu_enabled,
+            )
+            .context("right vector cross-term failed")?;
 
             let x =
                 self.transcript
@@ -182,7 +194,12 @@ impl DamascusProver {
             let folded_g = fold_vec_module(&g_left, &g_right, x_inv, self.parallel_enabled)?;
             let vector_recomputed = self
                 .committer
-                .commit_with_generators_ntt(&folded_message, &folded_g, self.ntt_enabled)
+                .commit_with_generators_ntt(
+                    &folded_message,
+                    &folded_g,
+                    self.ntt_enabled,
+                    self.gpu_enabled,
+                )
                 .context("recompute vector stage commitment")?;
             ensure!(
                 vector_fold_commitment == vector_recomputed,
@@ -216,11 +233,22 @@ impl DamascusProver {
             let (msg_even, msg_odd) = odd_even_vec_poly(&folded_message)?;
             let (g_even, g_odd_scaled) = odd_even_vec_module_scaled(&folded_g)?;
 
-            let l_poly =
-                cross_term_vec(&self.committer, &msg_even, &g_odd_scaled, self.ntt_enabled)
-                    .context("left poly cross-term failed")?;
-            let r_poly = cross_term_vec(&self.committer, &msg_odd, &g_even, self.ntt_enabled)
-                .context("right poly cross-term failed")?;
+            let l_poly = cross_term_vec(
+                &self.committer,
+                &msg_even,
+                &g_odd_scaled,
+                self.ntt_enabled,
+                self.gpu_enabled,
+            )
+            .context("left poly cross-term failed")?;
+            let r_poly = cross_term_vec(
+                &self.committer,
+                &msg_odd,
+                &g_even,
+                self.ntt_enabled,
+                self.gpu_enabled,
+            )
+            .context("right poly cross-term failed")?;
 
             let y = self.transcript.challenge_poly(
                 round_idx,
@@ -250,7 +278,12 @@ impl DamascusProver {
 
         let recomputed = self
             .committer
-            .commit_with_generators_ntt(&next_message, &next_g, self.ntt_enabled)
+            .commit_with_generators_ntt(
+                &next_message,
+                &next_g,
+                self.ntt_enabled,
+                self.gpu_enabled,
+            )
             .context("recompute post-poly commitment")?;
         ensure!(
             next_commitment == recomputed,
@@ -291,8 +324,9 @@ fn cross_term_vec(
     witness: &[Poly],
     g: &[ModuleCommitment],
     ntt_enabled: bool,
+    gpu_enabled: bool,
 ) -> Result<ModuleCommitment> {
-    committer.commit_with_generators_ntt(witness, g, ntt_enabled)
+    committer.commit_with_generators_ntt(witness, g, ntt_enabled, gpu_enabled)
 }
 
 fn fold_vec_poly(

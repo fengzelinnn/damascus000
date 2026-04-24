@@ -131,10 +131,10 @@ impl Poly {
         self.coeffs.iter().copied().sum()
     }
 
-    pub fn mul(&self, rhs: &Self, ntt_enabled: bool) -> Result<Self> {
+    pub fn mul(&self, rhs: &Self, ntt_enabled: bool, gpu_enabled: bool) -> Result<Self> {
         ensure!(self.len() == rhs.len(), "ring length mismatch");
         let coeffs = if ntt_enabled {
-            ntt::negacyclic_multiply(&self.coeffs, &rhs.coeffs)?
+            ntt::negacyclic_multiply(&self.coeffs, &rhs.coeffs, gpu_enabled)?
         } else {
             ntt::naive_negacyclic(&self.coeffs, &rhs.coeffs)
         };
@@ -232,9 +232,9 @@ mod tests {
             let b = Poly::from_scalar(scalar, MIN_RING_DEGREE);
             let b_inv = Poly::from_scalar(scalar.inv(), MIN_RING_DEGREE);
             let recovered = a
-                .mul(&b, true)
+                .mul(&b, true, true)
                 .expect("ab")
-                .mul(&b_inv, true)
+                .mul(&b_inv, true, true)
                 .expect("abb_inv");
             assert_eq!(recovered, a);
         }

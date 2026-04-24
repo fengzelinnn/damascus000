@@ -105,7 +105,7 @@ fn collect_benchmark_data() -> Result<BenchmarkRun> {
     let gpu_min_elements = env::var("DAMASCUS_GPU_MIN_ELEMS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16_777_216);
+        .unwrap_or(4_096);
 
     let mut verify_scenarios = Vec::new();
     let mut summary_rows = Vec::new();

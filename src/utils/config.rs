@@ -81,7 +81,7 @@ impl Default for RuntimeConfig {
             ntt_enabled: true,
             parallel_enabled: true,
             gpu_enabled: true,
-            gpu_min_elements: 2_097_152,
+            gpu_min_elements: 4_096,
         }
     }
 }

@@ -112,7 +112,11 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         self.commit_with_ntt(witness, true)
     }
 
-    pub fn commit_with_ntt(&self, witness: &[Poly], ntt_enabled: bool) -> Result<ModuleElement<K>> {
+    pub fn commit_with_ntt(
+        &self,
+        witness: &[Poly],
+        ntt_enabled: bool,
+    ) -> Result<ModuleElement<K>> {
         if witness.is_empty() {
             return Ok(ModuleElement::<K>::zero(1));
         }
@@ -124,7 +128,7 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         );
 
         let families = self.generators_for(witness.len(), ring_len)?;
-        self.commit_with_generators_ntt(witness, &families.g, ntt_enabled)
+        self.commit_with_generators_ntt(witness, &families.g, ntt_enabled, true)
     }
 
     pub fn commit_serial(&self, witness: &[Poly]) -> Result<ModuleElement<K>> {
@@ -136,7 +140,7 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         witness: &[Poly],
         g: &[ModuleElement<K>],
     ) -> Result<ModuleElement<K>> {
-        self.commit_with_generators_ntt(witness, g, true)
+        self.commit_with_generators_ntt(witness, g, true, true)
     }
 
     pub fn commit_with_generators_ntt(
@@ -144,6 +148,7 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         witness: &[Poly],
         g: &[ModuleElement<K>],
         ntt_enabled: bool,
+        gpu_enabled: bool,
     ) -> Result<ModuleElement<K>> {
         ensure!(
             witness.len() == g.len(),
@@ -156,7 +161,7 @@ impl<const K: usize> GenericModuleSisCommitter<K> {
         let ring_len = witness[0].len();
         let mut acc = ModuleElement::<K>::zero(ring_len);
         for idx in 0..witness.len() {
-            acc = acc.add(&g[idx].ring_mul_with_ntt(&witness[idx], ntt_enabled)?)?;
+            acc = acc.add(&g[idx].ring_mul_with_ntt(&witness[idx], ntt_enabled, gpu_enabled)?)?;
         }
         Ok(acc)
     }
@@ -261,8 +266,8 @@ mod tests {
         lhs.iter()
             .zip(rhs.iter())
             .map(|(l, r)| {
-                l.mul(a, true)
-                    .and_then(|left| left.add(&r.mul(b, true)?))
+                l.mul(a, true, true)
+                    .and_then(|left| left.add(&r.mul(b, true, true)?))
                     .expect("linear combination")
             })
             .collect()

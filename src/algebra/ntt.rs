@@ -109,7 +109,7 @@ pub fn convolution(a: &[Fp], b: &[Fp]) -> Result<Vec<Fp>> {
     Ok(out)
 }
 
-pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp]) -> Result<Vec<Fp>> {
+pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp], gpu_enabled: bool) -> Result<Vec<Fp>> {
     ensure!(
         !lhs.is_empty() && !rhs.is_empty(),
         "cannot multiply empty ring elements"
@@ -154,48 +154,32 @@ pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp]) -> Result<Vec<Fp>> {
         batched_b.push(b);
     }
 
-    let residues_per_prime = if let Some(gpu_results) = try_ntt_batch_gpu(
-        &batched_a,
-        &batched_b,
-        ntt_size,
-        &CRT_PRIMES,
-        &stage_roots,
-        &inv_roots,
-        &inv_sizes,
-    ) {
-        gpu_results
-            .into_iter()
-            .zip(CRT_PRIMES.iter())
-            .map(|(values, &modulus)| {
-                let mut reduced = vec![0u64; n];
-                for idx in 0..n {
-                    reduced[idx] = mod_sub(values[idx], values[idx + n], modulus);
-                }
-                reduced
-            })
-            .collect()
-    } else {
-        let mut residues_per_prime = Vec::with_capacity(CRT_PRIMES.len());
-        for (((mut a, mut b), plan), &modulus) in batched_a
-            .into_iter()
-            .zip(batched_b.into_iter())
-            .zip(plans.iter())
-            .zip(CRT_PRIMES.iter())
-        {
-            forward_ntt(&mut a, plan)?;
-            forward_ntt(&mut b, plan)?;
-            for (lhs_coeff, rhs_coeff) in a.iter_mut().zip(b.iter()) {
-                *lhs_coeff = mod_mul(*lhs_coeff, *rhs_coeff, modulus);
-            }
-            inverse_ntt(&mut a, plan)?;
-
-            let mut reduced = vec![0u64; n];
-            for idx in 0..n {
-                reduced[idx] = mod_sub(a[idx], a[idx + n], modulus);
-            }
-            residues_per_prime.push(reduced);
+    let residues_per_prime = if gpu_enabled {
+        if let Some(gpu_results) = try_ntt_batch_gpu(
+            &batched_a,
+            &batched_b,
+            ntt_size,
+            &CRT_PRIMES,
+            &stage_roots,
+            &inv_roots,
+            &inv_sizes,
+        ) {
+            gpu_results
+                .into_iter()
+                .zip(CRT_PRIMES.iter())
+                .map(|(values, &modulus)| {
+                    let mut reduced = vec![0u64; n];
+                    for idx in 0..n {
+                        reduced[idx] = mod_sub(values[idx], values[idx + n], modulus);
+                    }
+                    reduced
+                })
+                .collect()
+        } else {
+            cpu_ntt_residues(batched_a, batched_b, plans)?
         }
-        residues_per_prime
+    } else {
+        cpu_ntt_residues(batched_a, batched_b, plans)?
     };
 
     let crt = crt_data();
@@ -208,6 +192,35 @@ pub fn negacyclic_multiply(lhs: &[Fp], rhs: &[Fp]) -> Result<Vec<Fp>> {
         coeffs.push(Fp::from_u128(reconstruct_mod_q(&residues, crt)?));
     }
     Ok(coeffs)
+}
+
+fn cpu_ntt_residues(
+    batched_a: Vec<Vec<u64>>,
+    batched_b: Vec<Vec<u64>>,
+    plans: Vec<Arc<NttPlan>>,
+) -> Result<Vec<Vec<u64>>> {
+    let n = plans[0].size() / 2;
+    let mut residues_per_prime = Vec::with_capacity(CRT_PRIMES.len());
+    for (((mut a, mut b), plan), &modulus) in batched_a
+        .into_iter()
+        .zip(batched_b.into_iter())
+        .zip(plans.iter())
+        .zip(CRT_PRIMES.iter())
+    {
+        forward_ntt(&mut a, plan)?;
+        forward_ntt(&mut b, plan)?;
+        for (lhs_coeff, rhs_coeff) in a.iter_mut().zip(b.iter()) {
+            *lhs_coeff = mod_mul(*lhs_coeff, *rhs_coeff, modulus);
+        }
+        inverse_ntt(&mut a, plan)?;
+
+        let mut reduced = vec![0u64; n];
+        for idx in 0..n {
+            reduced[idx] = mod_sub(a[idx], a[idx + n], modulus);
+        }
+        residues_per_prime.push(reduced);
+    }
+    Ok(residues_per_prime)
 }
 
 pub fn naive_negacyclic(lhs: &[Fp], rhs: &[Fp]) -> Vec<Fp> {
@@ -459,7 +472,7 @@ mod tests {
         let rhs = (0..MIN_RING_DEGREE)
             .map(|idx| Fp::from((idx * 3 + 5) as u64))
             .collect::<Vec<_>>();
-        let ntt = negacyclic_multiply(&lhs, &rhs).expect("ntt mul");
+        let ntt = negacyclic_multiply(&lhs, &rhs, true).expect("ntt mul");
         let naive = naive_negacyclic(&lhs, &rhs);
         assert_eq!(ntt, naive);
     }
@@ -473,7 +486,7 @@ mod tests {
             let rhs = (0..len)
                 .map(|idx| Fp::from(((idx * 7) + 3) as u64))
                 .collect::<Vec<_>>();
-            let ntt = negacyclic_multiply(&lhs, &rhs).expect("ntt mul");
+            let ntt = negacyclic_multiply(&lhs, &rhs, true).expect("ntt mul");
             let naive = naive_negacyclic(&lhs, &rhs);
             assert_eq!(ntt, naive, "ring length {len} mismatch");
         }
@@ -500,7 +513,7 @@ mod tests {
             let mut rhs = vec![Fp::zero(); len];
             lhs[len - 1] = Fp::from(3u64);
             rhs[1] = Fp::from(5u64);
-            let ntt = negacyclic_multiply(&lhs, &rhs).expect("ntt mul");
+            let ntt = negacyclic_multiply(&lhs, &rhs, true).expect("ntt mul");
             let mut expected = vec![Fp::zero(); len];
             expected[0] = -Fp::from(15u64);
             assert_eq!(ntt, expected, "ring length {len} mismatch");

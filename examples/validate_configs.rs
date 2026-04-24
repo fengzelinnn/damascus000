@@ -38,11 +38,11 @@ fn main() {
         let b = random_poly(0xcafebabe, n);
 
         let t0 = Instant::now();
-        let result_ntt = a.mul(&b, true).expect("ntt mul");
+        let result_ntt = a.mul(&b, true, true).expect("ntt mul");
         let t_ntt = t0.elapsed();
 
         let t0 = Instant::now();
-        let result_naive = a.mul(&b, false).expect("naive mul");
+        let result_naive = a.mul(&b, false, true).expect("naive mul");
         let t_naive = t0.elapsed();
 
         let match_ok = result_ntt == result_naive;
@@ -108,7 +108,7 @@ fn main() {
         let a = random_poly(0x1234, n);
         let b = random_poly(0x5678, n);
         // negacyclic_multiply tries GPU first, falls back to CPU
-        let result = ntt::negacyclic_multiply(&a.coeffs, &b.coeffs).expect("gpu ntt mul");
+        let result = ntt::negacyclic_multiply(&a.coeffs, &b.coeffs, true).expect("gpu ntt mul");
         let result_cpu = ntt::naive_negacyclic(&a.coeffs, &b.coeffs);
         let match_ok = result == result_cpu;
         println!(
